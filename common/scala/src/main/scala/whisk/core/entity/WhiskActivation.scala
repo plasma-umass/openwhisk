@@ -136,7 +136,8 @@ object WhiskActivation
   val initTimeAnnotation = "initTime"
   val waitTimeAnnotation = "waitTime"
   val conductorAnnotation = "conductor"
-
+  val projectionAnnotation = "projection"
+  
   /** Some field names for compositions */
   val actionField = "action"
   val paramsField = "params"

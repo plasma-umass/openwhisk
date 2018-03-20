@@ -30,7 +30,7 @@ import whisk.core.controller.WhiskServices
 import whisk.core.entity._
 import whisk.http.Messages
 
-protected[core] trait PostActionActivation extends PrimitiveActions with SequenceActions {
+protected[core] trait PostActionActivation extends PrimitiveActions with SequenceActions with ProjectionActions{
   /** The core collections require backend services to be injected in this trait. */
   services: WhiskServices =>
 
@@ -50,8 +50,16 @@ protected[core] trait PostActionActivation extends PrimitiveActions with Sequenc
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+    System.out.println ("PostActionActivation:53 invokeAction")
     action.toExecutableWhiskAction match {
       // this is a topmost sequence
+      case None if action.exec.isInstanceOf[ProjectionExecMetaData] =>
+      //case ProjectionExecMetaData =>
+        System.out.println ("PostActionActivation: invokeProjection")
+        val ProjectionExecMetaData(components, code) = action.exec
+        System.out.println ("After ProjectionExecMetaData")
+        System.out.println ("Code is $code")
+        invokeProjection(user, action, components, code, payload, waitForResponse, cause, topmost = true, 0).map(r => r._1)
       case None =>
         val SequenceExecMetaData(components) = action.exec
         invokeSequence(user, action, components, payload, waitForResponse, cause, topmost = true, 0).map(r => r._1)

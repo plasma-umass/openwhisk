@@ -42,7 +42,9 @@ import whisk.core.entity.types._
 import whisk.http.Messages._
 import whisk.utils.ExecutionContextFactory.FutureExtensions
 
-protected[actions] trait SequenceActions {
+import sys.process._
+
+protected[actions] trait ProjectionActions {
   /** The core collections require backend services to be injected in this trait. */
   services: WhiskServices =>
 
@@ -82,30 +84,34 @@ protected[actions] trait SequenceActions {
    * @param transid a transaction id for logging
    * @return a future of type (ActivationId, Some(WhiskActivation), atomicActionsCount) if blocking; else (ActivationId, None, 0)
    */
-  protected[actions] def invokeSequence(
+  protected[actions] def invokeProjection(
     user: Identity,
     action: WhiskActionMetaData,
     components: Vector[FullyQualifiedEntityName],
+    code: String,
     payload: Option[JsObject],
     waitForOutermostResponse: Option[FiniteDuration],
     cause: Option[ActivationId],
     topmost: Boolean,
     atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)] = {
-    require(action.exec.kind == Exec.SEQUENCE, "this method requires an action sequence")
+    require(action.exec.kind == Exec.PROJECTION, "this method requires an action projection")
+    //require(action.annotations.isTruthy(WhiskActivation.projectionAnnotation), "this method requires projection annotation with action")
     
+    System.out.println ("InvokeProjection: Has Projection Annotion = " + action.annotations.isTruthy(WhiskActivation.projectionAnnotation));
+    //System.out.println ("action.code " + asInstanceOf[])
     // create new activation id that corresponds to the sequence
     val seqActivationId = activationIdFactory.make()
-    logging.info(this, s"invoking sequence $action topmost $topmost activationid '$seqActivationId'")
-
+    logging.info(this, s"invoking projection $action topmost $topmost activationid '$seqActivationId' with code $code")
+    //val ProjectionExecMetaData(components, code) = action.exec
     val start = Instant.now(Clock.systemUTC())
     val futureSeqResult: Future[(Either[ActivationId, WhiskActivation], Int)] = {
-      // even though the result of completeSequenceActivation is Right[WhiskActivation],
+      // even though the result of completeProjectionActivation is Right[WhiskActivation],
       // use a more general type for futureSeqResult in case a blocking invoke takes
       // longer than expected and we must return Left[ActivationId] instead
-      completeSequenceActivation(
+      completeProjectionActivation(
         seqActivationId,
         // the cause for the component activations is the current sequence
-        invokeSequenceComponents(
+        invokeProjectionComponents(
           user,
           action,
           seqActivationId,
@@ -130,7 +136,6 @@ protected[actions] trait SequenceActions {
         }
         .getOrElse {
           // non-blocking sequence execution, return activation id
-          // non-blocking sequence execution, return activation id
           Future.successful(Left(seqActivationId), 0)
         }
     } else {
@@ -144,8 +149,8 @@ protected[actions] trait SequenceActions {
   /**
    * Creates an activation for the sequence and writes it back to the datastore.
    */
-  private def completeSequenceActivation(seqActivationId: ActivationId,
-                                         futureSeqResult: Future[SequenceAccounting],
+  private def completeProjectionActivation(seqActivationId: ActivationId,
+                                         futureSeqResult: Future[ProjectionAccounting],
                                          user: Identity,
                                          action: WhiskActionMetaData,
                                          topmost: Boolean,
@@ -159,22 +164,22 @@ protected[actions] trait SequenceActions {
         // sequence terminated, the result of the sequence is the result of the last completed activation
         val end = Instant.now(Clock.systemUTC())
         val seqActivation =
-          makeSequenceActivation(user, action, seqActivationId, accounting, topmost, cause, start, end)
+          makeProjectionActivation(user, action, seqActivationId, accounting, topmost, cause, start, end)
         (Right(seqActivation), accounting.atomicActionCnt)
       }
       .andThen {
-        case Success((Right(seqActivation), _)) => storeSequenceActivation(seqActivation)
+        case Success((Right(seqActivation), _)) => storeProjectionActivation(seqActivation)
 
         // This should never happen; in this case, there is no activation record created or stored:
         // should there be?
-        case Failure(t) => logging.error(this, s"Sequence activation failed: ${t.getMessage}")
+        case Failure(t) => logging.error(this, s"Projection activation failed: ${t.getMessage}")
       }
   }
 
   /**
    * Stores sequence activation to database.
    */
-  private def storeSequenceActivation(activation: WhiskActivation)(implicit transid: TransactionId): Unit = {
+  private def storeProjectionActivation(activation: WhiskActivation)(implicit transid: TransactionId): Unit = {
     logging.debug(this, s"recording activation '${activation.activationId}'")
     WhiskActivation.put(activationStore, activation)(transid, notifier = None) onComplete {
       case Success(id) => logging.debug(this, s"recorded activation")
@@ -188,25 +193,25 @@ protected[actions] trait SequenceActions {
   /**
    * Creates an activation for a sequence.
    */
-  private def makeSequenceActivation(user: Identity,
+  private def makeProjectionActivation(user: Identity,
                                      action: WhiskActionMetaData,
                                      activationId: ActivationId,
-                                     accounting: SequenceAccounting,
+                                     accounting: ProjectionAccounting,
                                      topmost: Boolean,
                                      cause: Option[ActivationId],
                                      start: Instant,
                                      end: Instant): WhiskActivation = {
 
     // compute max memory
-    val sequenceLimits = accounting.maxMemory map { maxMemoryAcrossActionsInSequence =>
+    val sequenceLimits = accounting.maxMemory map { maxMemoryAcrossActionsInProjection =>
       Parameters(
         WhiskActivation.limitsAnnotation,
-        ActionLimits(action.limits.timeout, MemoryLimit(maxMemoryAcrossActionsInSequence MB), action.limits.logs).toJson)
+        ActionLimits(action.limits.timeout, MemoryLimit(maxMemoryAcrossActionsInProjection MB), action.limits.logs).toJson)
     }
 
     // set causedBy if not topmost sequence
     val causedBy = if (!topmost) {
-      Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
+      Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.PROJECTION)))
     } else None
 
     // create the whisk activation
@@ -224,7 +229,7 @@ protected[actions] trait SequenceActions {
       publish = false,
       annotations = Parameters(WhiskActivation.topmostAnnotation, JsBoolean(topmost)) ++
         Parameters(WhiskActivation.pathAnnotation, JsString(action.fullyQualifiedName(false).asString)) ++
-        Parameters(WhiskActivation.kindAnnotation, JsString(Exec.SEQUENCE)) ++
+        Parameters(WhiskActivation.kindAnnotation, JsString(Exec.PROJECTION)) ++
         causedBy ++
         sequenceLimits,
       duration = Some(accounting.duration))
@@ -245,14 +250,14 @@ protected[actions] trait SequenceActions {
    * @param atomicActionCnt the dynamic atomic action count observed so far since the start of the execution of the topmost sequence
    * @return a future which resolves with the accounting for a sequence, including the last result, duration, and activation ids
    */
-  private def invokeSequenceComponents(
+  private def invokeProjectionComponents(
     user: Identity,
     seqAction: WhiskActionMetaData,
     seqActivationId: ActivationId,
     inputPayload: Option[JsObject],
     components: Vector[FullyQualifiedEntityName],
     cause: Option[ActivationId],
-    atomicActionCnt: Int)(implicit transid: TransactionId): Future[SequenceAccounting] = {
+    atomicActionCnt: Int)(implicit transid: TransactionId): Future[ProjectionAccounting] = {
 
     // For each action in the sequence, fetch any of its associated parameters (including package or binding).
     // We do this for all of the actions in the sequence even though it may be short circuited. This is to
@@ -262,40 +267,40 @@ protected[actions] trait SequenceActions {
     //
     // This action/parameter resolution is done in futures; the execution starts as soon as the first component
     // is resolved.
-    System.err.println ("invokeSequenceComponents: Has Projection Annotion = " + seqAction.annotations.isTruthy(WhiskActivation.projectionAnnotation));
+    System.err.println ("invokeProjectionComponents: Has Projection Annotion = " + seqAction.annotations.isTruthy(WhiskActivation.projectionAnnotation));
     val resolvedFutureActions = resolveDefaultNamespace(components, user) map { c =>
       WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, c)
     }
 
     // this holds the initial value of the accounting structure, including the input boxed as an ActivationResponse
     val initialAccounting = Future.successful {
-      SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
+      ProjectionAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
     }
 
     // execute the actions in sequential blocking fashion
     resolvedFutureActions
       .foldLeft(initialAccounting) { (accountingFuture, futureAction) =>
         accountingFuture.flatMap { accounting =>
-          if (accounting.atomicActionCnt < actionSequenceLimit) {
+          if (accounting.atomicActionCnt < actionProjectionLimit) {
             invokeNextAction(user, futureAction, accounting, cause).flatMap { accounting =>
               if (!accounting.shortcircuit) {
                 Future.successful(accounting)
               } else {
                 // this is to short circuit the fold
-                Future.failed(FailedSequenceActivation(accounting)) // terminates the fold
+                Future.failed(FailedProjectionActivation(accounting)) // terminates the fold
               }
             }
           } else {
             val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
-            Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
+            Future.failed(FailedProjectionActivation(updatedAccount)) // terminates the fold
           }
         }
       }
       .recoverWith {
         // turn the failed accounting back to success; this is the only possible failure
         // since all throwables are recovered with a failed accounting instance and this is
-        // in turned boxed to FailedSequenceActivation
-        case FailedSequenceActivation(accounting) => Future.successful(accounting)
+        // in turned boxed to FailedProjectionActivation
+        case FailedProjectionActivation(accounting) => Future.successful(accounting)
       }
   }
 
@@ -315,24 +320,29 @@ protected[actions] trait SequenceActions {
   private def invokeNextAction(
     user: Identity,
     futureAction: Future[WhiskActionMetaData],
-    accounting: SequenceAccounting,
-    cause: Option[ActivationId])(implicit transid: TransactionId): Future[SequenceAccounting] = {
+    accounting: ProjectionAccounting,
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[ProjectionAccounting] = {
     futureAction.flatMap { action =>
       // the previous response becomes input for the next action in the sequence;
       // the accounting no longer needs to hold a reference to it once the action is
       // invoked, so previousResponse.getAndSet(null) drops the reference at this point
       // which prevents dragging the previous response for the lifetime of the next activation
       val inputPayload = accounting.previousResponse.getAndSet(null).result.map(_.asJsObject)
+      System.out.println (s"invokeNextAction: inputPayload " + inputPayload);
+      System.out.println (s"ProjectionActions.scala:330 results " + accounting.results.toString)
+      val jq_res = ("/usr/bin/jq" !!)
+      System.out.println (s"Executing jq $jq_res")
       // invoke the action by calling the right method depending on whether it's an atomic action or a sequence
       val futureWhiskActivationTuple = action.toExecutableWhiskAction match {
         case None =>
-          val SequenceExecMetaData(components) = action.exec
+          val ProjectionExecMetaData(components, code) = action.exec
           logging.info(this, s"sequence invoking an enclosed sequence $action")
-          // call invokeSequence to invoke the inner sequence; this is a blocking activation by definition
-          invokeSequence(
+          // call invokeProjection to invoke the inner sequence; this is a blocking activation by definition
+          invokeProjection(
             user,
             action,
             components,
+            code,
             inputPayload,
             None,
             cause,
@@ -350,7 +360,7 @@ protected[actions] trait SequenceActions {
       futureWhiskActivationTuple
         .map {
           case (Right(activation), atomicActionCountSoFar) =>
-            accounting.maybe(activation, atomicActionCountSoFar, actionSequenceLimit)
+            accounting.maybe(activation, atomicActionCountSoFar, actionProjectionLimit)
 
           case (Left(activationId), atomicActionCountSoFar) =>
             // the result could not be retrieved in time either from active ack or from db
@@ -377,7 +387,7 @@ protected[actions] trait SequenceActions {
   }
 
   /** Max atomic action count allowed for sequences */
-  private lazy val actionSequenceLimit = whiskConfig.actionSequenceLimit.toInt
+  private lazy val actionProjectionLimit = whiskConfig.actionProjectionLimit.toInt
 }
 
 /**
@@ -393,8 +403,9 @@ protected[actions] trait SequenceActions {
  *        components (needed to annotate the sequence with GB-s)
  * @param shortcircuit when true, stops the execution of the next component in the sequence
  */
-protected[actions] case class SequenceAccounting(atomicActionCnt: Int,
+protected[actions] case class ProjectionAccounting(atomicActionCnt: Int,
                                                  previousResponse: AtomicReference[ActivationResponse],
+                                                 results: Map[String, JsObject],
                                                  logs: mutable.Buffer[ActivationId],
                                                  duration: Long = 0,
                                                  maxMemory: Option[Int] = None,
@@ -406,12 +417,20 @@ protected[actions] case class SequenceAccounting(atomicActionCnt: Int,
   /** The previous activation was successful. */
   private def success(activation: WhiskActivation, newCnt: Int, shortcircuit: Boolean = false) = {
     previousResponse.set(null)
-    SequenceAccounting(
+    System.out.println(s"ProjectionActions.scala:414 ProjectionAccounting::success " + activation.response.result.map(_.asJsObject))
+    System.out.println(s"creating ProjectionAccounting $results")
+    System.out.println(s"converting activation.response ")
+    val act = activation.response.result.map(_.asJsObject).getOrElse(JsObject.empty)
+    System.out.println(s"res_jsvalue converted")
+    val res_map = this.results + ("ret_"+newCnt.toString -> act)
+    System.out.println(s"jsarray created")
+    ProjectionAccounting(
       prev = this,
       newCnt = newCnt,
       shortcircuit = shortcircuit,
       incrDuration = activation.duration,
       newResponse = activation.response,
+      newResults = res_map,
       newActivationId = activation.activationId,
       newMemoryLimit = activation.annotations.get("limits") map { limitsAnnotation => // we have a limits annotation
         limitsAnnotation.asJsObject.getFields("memory") match {
@@ -429,14 +448,14 @@ protected[actions] case class SequenceAccounting(atomicActionCnt: Int,
   }
 
   /** Determines whether the previous activation succeeded or failed. */
-  def maybe(activation: WhiskActivation, newCnt: Int, maxSequenceCnt: Int) = {
+  def maybe(activation: WhiskActivation, newCnt: Int, maxProjectionCnt: Int) = {
     // check conditions on payload that may lead to interrupting the execution of the sequence
     //     short-circuit the execution of the sequence iff the payload contains an error field
     //     and is the result of an action return, not the initial payload
     val outputPayload = activation.response.result.map(_.asJsObject)
     val payloadContent = outputPayload getOrElse JsObject.empty
     val errorField = payloadContent.fields.get(ActivationResponse.ERROR_FIELD)
-    val withinSeqLimit = newCnt <= maxSequenceCnt
+    val withinSeqLimit = newCnt <= maxProjectionCnt
 
     if (withinSeqLimit && errorField.isEmpty) {
       // all good with this action invocation
@@ -461,25 +480,26 @@ protected[actions] case class SequenceAccounting(atomicActionCnt: Int,
 }
 
 /**
- *  Three constructors for SequenceAccounting:
+ *  Three constructors for ProjectionAccounting:
  *     - one for successful invocation of an action in the sequence,
  *     - one for failed invocation, and
  *     - one to initialize things
  */
-protected[actions] object SequenceAccounting {
+protected[actions] object ProjectionAccounting {
 
   def maxMemory(prevMemoryLimit: Option[Int], newMemoryLimit: Option[Int]): Option[Int] = {
     (prevMemoryLimit ++ newMemoryLimit).reduceOption(Math.max)
   }
 
   // constructor for successful invocations, or error'ing ones (where shortcircuit = true)
-  def apply(prev: SequenceAccounting,
+  def apply(prev: ProjectionAccounting,
             newCnt: Int,
             incrDuration: Option[Long],
             newResponse: ActivationResponse,
+            newResults: Map[String, JsObject],
             newActivationId: ActivationId,
             newMemoryLimit: Option[Int],
-            shortcircuit: Boolean): SequenceAccounting = {
+            shortcircuit: Boolean): ProjectionAccounting = {
 
     // compute the new max memory
     val newMaxMemory = maxMemory(prev.maxMemory, newMemoryLimit)
@@ -487,9 +507,10 @@ protected[actions] object SequenceAccounting {
     // append log entry
     prev.logs += newActivationId
 
-    SequenceAccounting(
+    ProjectionAccounting(
       atomicActionCnt = newCnt,
       previousResponse = new AtomicReference(newResponse),
+      results = newResults,
       logs = prev.logs,
       duration = incrDuration map { prev.duration + _ } getOrElse { prev.duration },
       maxMemory = newMaxMemory,
@@ -497,9 +518,9 @@ protected[actions] object SequenceAccounting {
   }
 
   // constructor for initial payload
-  def apply(atomicActionCnt: Int, initialPayload: ActivationResponse): SequenceAccounting = {
-    SequenceAccounting(atomicActionCnt, new AtomicReference(initialPayload), mutable.Buffer.empty)
+  def apply(atomicActionCnt: Int, initialPayload: ActivationResponse): ProjectionAccounting = {
+    ProjectionAccounting(atomicActionCnt, new AtomicReference(initialPayload), Map("args_0" -> initialPayload.result.map(_.asJsObject).getOrElse(JsObject.empty)), mutable.Buffer.empty)
   }
 }
 
-protected[actions] case class FailedSequenceActivation(accounting: SequenceAccounting) extends Throwable
+protected[actions] case class FailedProjectionActivation(accounting: ProjectionAccounting) extends Throwable

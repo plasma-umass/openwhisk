@@ -407,6 +407,14 @@ trait ReferencedEntities {
         e.components.map { c =>
           Resource(c.path, Collection(Collection.ACTIONS), Some(c.name.asString))
         }.toSet
+      case e: ProjectionExec =>
+        e.components.map { c =>
+          Resource(c.path, Collection(Collection.ACTIONS), Some(c.name.asString))
+        }.toSet
+      case e: ProjectionExecMetaData =>
+        e.components.map { c =>
+          Resource(c.path, Collection(Collection.ACTIONS), Some(c.name.asString))
+        }.toSet
       case _ => Set()
     }
   }

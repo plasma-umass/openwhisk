@@ -118,6 +118,7 @@ object Invoker {
         case _                                               => abort(s"Error processing command line arguments $ls")
       }
     }
+    System.err.println (args.toList)
     val cmdLineArgs = parse(args.toList, CmdLineArgs())
     logger.info(this, "Command line arguments parsed to yield " + cmdLineArgs)
 

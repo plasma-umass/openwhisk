@@ -408,6 +408,8 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
   /** Creates a WhiskAction from PUT content, generating default values where necessary. */
   private def make(user: Identity, entityName: FullyQualifiedEntityName, content: WhiskActionPut)(
     implicit transid: TransactionId) = {
+    System.err.println ("Actions.scala:411\n")
+    Thread.dumpStack ()
     content.exec map {
       case seq: SequenceExec =>
         // check that the sequence conforms to max length and no recursion rules
@@ -471,16 +473,22 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         Parameters("_actions", JsArray(seq.components map { c =>
           JsString("/" + c.toString)
         }))
+      case seq: ProjectionExec =>
+        Parameters("_actions", JsArray(seq.components map { c =>
+          JsString("/" + c.toString)
+        }))
       case _ =>
         content.parameters getOrElse {
           action.exec match {
             case seq: SequenceExec => Parameters()
+            case seq: ProjectionExec => Parameters()
             case _                 => action.parameters
           }
         }
     } getOrElse {
       action.exec match {
         case seq: SequenceExec => action.parameters // discard content.parameters
+        case seq: ProjectionExec => action.parameters // discard content.parameters
         case _                 => content.parameters getOrElse action.parameters
       }
     }

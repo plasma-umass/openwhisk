@@ -95,6 +95,7 @@ class WhiskConfig(requiredProperties: Map[String, String],
   val triggerFirePerMinuteLimit = this(WhiskConfig.triggerFirePerMinuteLimit)
   val actionInvokeSystemOverloadLimit = this(WhiskConfig.actionInvokeSystemOverloadLimit)
   val actionSequenceLimit = this(WhiskConfig.actionSequenceMaxLimit)
+  val actionProjectionLimit = this(WhiskConfig.actionSequenceMaxLimit)
   val controllerSeedNodes = this(WhiskConfig.controllerSeedNodes)
   val controllerLocalBookkeeping = getAsBoolean(WhiskConfig.controllerLocalBookkeeping, false)
 }
@@ -224,6 +225,7 @@ object WhiskConfig {
   val runtimesManifest = "runtimes.manifest"
 
   val actionSequenceMaxLimit = "limits.actions.sequence.maxLength"
+  val actionProjectionMaxLimit = "limits.actions.sequence.maxLength"
   val actionInvokePerMinuteLimit = "limits.actions.invokes.perMinute"
   val actionInvokeConcurrentLimit = "limits.actions.invokes.concurrent"
   val actionInvokeSystemOverloadLimit = "limits.actions.invokes.concurrentInSystem"

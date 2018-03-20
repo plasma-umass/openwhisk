@@ -128,6 +128,18 @@ object Messages {
   def compositionComponentNotAccessible(name: String) =
     s"""Failed entitlement check for action with name "$name" during composition."""
 
+  /** Error messages for projections. */
+  val projectionIsTooLong = "Too many actions in the projection."
+  val projectionActivationFailure = "Activation failure during projection."
+  def projectionActivationTimeout(id: ActivationId) =
+    s"Timeout reached when retrieving activation $id during projection."
+  def projectionComponentInvalid(value: JsValue) =
+    s"Failed to parse action name from json value $value during projection."
+  def projectionComponentNotFound(name: String) =
+    s"""Failed to resolve action with name "$name" during projection."""
+  def projectionComponentNotAccessible(name: String) =
+    s"""Failed entitlement check for action with name "$name" during projection."""
+
   /** Error messages for bad requests where parameters do not conform. */
   val parametersNotAllowed = "Request defines parameters that are not allowed (e.g., reserved properties)."
   def invalidTimeout(max: FiniteDuration) = s"Timeout must be number of milliseconds up to ${max.toMillis}."

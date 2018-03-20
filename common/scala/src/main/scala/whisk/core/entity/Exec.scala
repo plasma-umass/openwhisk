@@ -212,6 +212,26 @@ protected[core] case class SequenceExecMetaData(components: Vector[FullyQualifie
   override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
 }
 
+protected[core] case class ProjectionExecMetaData(components: Vector[FullyQualifiedEntityName], val _code:String) extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.PROJECTION
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+  val code = _code
+}
+
+protected[core] case class ProjectionExec(components: Vector[FullyQualifiedEntityName], val _code:String) extends Exec {
+  override val kind = Exec.PROJECTION
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+  val code = _code
+}
+
+//~ protected[core] case class ProjectionExecMetaData(components: Vector[FullyQualifiedEntityName]) extends SequenceExecMetaDataBase {
+  //~ override val kind = ExecMetaDataBase.PROJECTION
+  //~ override val deprecated = false
+  //~ override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+//~ }
+
 protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol {
 
   val sizeLimit = 48 MB
@@ -221,7 +241,8 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
   // - Black Box because it is a type marker
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
-
+  protected[core] val PROJECTION = "projection"
+  
   private def execManifests = ExecManifest.runtimesManifest
 
   override protected[core] implicit lazy val serdes = new RootJsonFormat[Exec] {
@@ -242,7 +263,11 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
 
       case s @ SequenceExec(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
-
+        
+      case s @ ProjectionExec(comp, code) =>
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson,
+                 "code" -> JsString(code))
+        
       case b: BlackBoxExec =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
@@ -270,6 +295,15 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
       }
 
       kind match {
+        case Exec.PROJECTION =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          val code: String = obj.fields.get("code").toString()
+          ProjectionExec(comp, code)
+          
         case Exec.SEQUENCE =>
           val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
             case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
@@ -299,7 +333,7 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
           // map "default" virtual runtime versions to the currently blessed actual runtime version
           val manifest = execManifests.resolveDefaultRuntime(kind) match {
             case Some(k) => k
-            case None    => throw new DeserializationException(s"kind '$kind' not in $runtimes")
+            case None    => throw new DeserializationException(s"kind '$kind' NOT in $runtimes")
           }
 
           manifest.attached
@@ -351,6 +385,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
   // - Black Box because it is a type marker
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
+  protected[core] val PROJECTION = "projection"
 
   private def execManifests = ExecManifest.runtimesManifest
 
@@ -372,7 +407,11 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
 
       case s @ SequenceExecMetaData(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
-
+      
+      case s @ ProjectionExecMetaData(comp, code) =>
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson,
+                 "code" -> JsString(code))
+        
       case b: BlackBoxExecMetaData =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
@@ -410,7 +449,13 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
             case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
           }
           SequenceExecMetaData(comp)
-
+        case ExecMetaDataBase.PROJECTION =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ProjectionExecMetaData(comp, obj.fields.get("code").toString())
         case ExecMetaDataBase.BLACKBOX =>
           val image: ImageName = obj.fields.get("image") match {
             case Some(JsString(i)) => ImageName.fromString(i).get // throws deserialization exception on failure
@@ -425,7 +470,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           // map "default" virtual runtime versions to the currently blessed actual runtime version
           val manifest = execManifests.resolveDefaultRuntime(kind) match {
             case Some(k) => k
-            case None    => throw new DeserializationException(s"kind '$kind' not in $runtimes")
+            case None    => throw new DeserializationException(s"kind '$kind' Not in $runtimes")
           }
 
           manifest.attached

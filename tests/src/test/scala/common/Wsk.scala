@@ -250,11 +250,12 @@ class WskAction()
     update: Boolean = false,
     web: Option[String] = None,
     expectedExitCode: Int = SUCCESS_EXIT)(implicit wp: WskProps): RunResult = {
+
     val params = Seq(noun, if (!update) "create" else "update", "--auth", wp.authKey, fqn(name)) ++ {
       artifact map { Seq(_) } getOrElse Seq()
     } ++ {
       kind map { k =>
-        if (k == "sequence" || k == "copy" || k == "native") Seq(s"--$k")
+        if (k == "sequence" || k == "copy" || k == "native" || k == "projection") Seq(s"--$k")
         else Seq("--kind", k)
       } getOrElse Seq()
     } ++ {
@@ -1029,6 +1030,8 @@ trait RunWskCmd extends BaseRunWsk {
           showCmd: Boolean = false,
           hideFromOutput: Seq[String] = Seq()): RunResult = {
     val args = baseCommand
+    System.err.println ("AAAAAAAAAAA")
+    System.err.println (args +  " " + params)
     if (verbose) args += "--verbose"
     if (showCmd) println(args.mkString(" ") + " " + params.mkString(" "))
     val rr = TestUtils.runCmd(

@@ -19,6 +19,7 @@ package whisk.core.controller.actions
 
 import java.time.Clock
 import java.time.Instant
+//import java.io._
 
 import scala.collection.mutable.Buffer
 import scala.concurrent.ExecutionContext
@@ -86,7 +87,18 @@ protected[actions] trait PrimitiveActions {
     cause: Option[ActivationId],
     topmost: Boolean,
     atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)]
-
+  
+  protected[actions] def invokeProjection(
+    user: Identity,
+    action: WhiskActionMetaData,
+    components: Vector[FullyQualifiedEntityName],
+    code: String,
+    payload: Option[JsObject],
+    waitForOutermostResponse: Option[FiniteDuration],
+    cause: Option[ActivationId],
+    topmost: Boolean,
+    atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)];
+      
   /**
    * A method that knows how to invoke a single primitive action or a composition.
    *
@@ -114,7 +126,14 @@ protected[actions] trait PrimitiveActions {
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
 
-    if (action.annotations.isTruthy(WhiskActivation.conductorAnnotation)) {
+    System.err.println ("InvokeSingleAction: Has Projection Annotation = " + action.annotations.isTruthy(WhiskActivation.projectionAnnotation));
+    /*if (action.annotations.isTruthy(WhiskActivation.projectionAnnotation))
+    {
+      //System.err.println ("PrimitiveActions.scala:120, projection annotation true\n")
+      //invokeComposition(user, action, payload, waitForResponse, cause)
+      //invokeProjection(user, action, payload, waitForResponse, cause)
+    }
+    else*/ if (action.annotations.isTruthy(WhiskActivation.conductorAnnotation)) {
       invokeComposition(user, action, payload, waitForResponse, cause)
     } else {
       invokeSimpleAction(user, action, payload, waitForResponse, cause)
@@ -156,8 +175,7 @@ protected[actions] trait PrimitiveActions {
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
-
-    // merge package parameters with action (action parameters supersede), then merge in payload
+      
     val args = action.parameters merge payload
     val message = ActivationMessage(
       transid,
@@ -411,7 +429,7 @@ protected[actions] trait PrimitiveActions {
    */
   private def invokeComponent(user: Identity, action: WhiskActionMetaData, payload: Option[JsObject], session: Session)(
     implicit transid: TransactionId): Future[ActivationResponse] = {
-
+    System.err.println ("Has Projection Annotation? = " + action.annotations.isTruthy(WhiskActivation.projectionAnnotation));
     val exec = action.toExecutableWhiskAction
     val activationResponse: Future[Either[ActivationId, WhiskActivation]] = exec match {
       case Some(action) if action.annotations.isTruthy(WhiskActivation.conductorAnnotation) => // composition
@@ -431,6 +449,21 @@ protected[actions] trait PrimitiveActions {
           payload,
           waitForResponse = Some(action.limits.timeout.duration + 1.minute),
           cause = Some(session.activationId))
+      case None if action.exec.isInstanceOf[ProjectionExecMetaData] => // projection
+        System.err.println ("Executing Projection\n");
+        session.accounting.components += 1
+        val ProjectionExecMetaData(components, code) = action.exec
+        invokeProjection (
+          user,
+          action,
+          components,
+          code,
+          payload,
+          waitForOutermostResponse = None,
+          cause = Some(session.activationId),
+          topmost = false,
+          atomicActionsCount = 0).map(r => r._1)
+      
       case None => // sequence
         session.accounting.components += 1
         val SequenceExecMetaData(components) = action.exec
