@@ -330,6 +330,20 @@ protected[actions] trait SequenceActions {
 
       // invoke the action by calling the right method depending on whether it's an atomic action or a sequence
       val futureWhiskActivationTuple = action.toExecutableWhiskAction match {
+        case None if action.exec.isInstanceOf[ProjectionExecMetaData] =>
+          // this is an invoke for an atomic action
+          logging.info(this, s"sequence invoking a projection action $action")
+          val timeout = action.limits.timeout.duration + 1.minute
+          invokeAction(user, action, inputPayload, waitForResponse = Some(timeout), cause) map {
+            case res => (res, accounting.atomicActionCnt + 1)
+          }
+        case None if action.exec.isInstanceOf[ForkExecMetaData] =>
+          // this is an invoke for an atomic action
+          logging.info(this, s"sequence invoking a fork action $action")
+          val timeout = action.limits.timeout.duration + 1.minute
+          invokeAction(user, action, inputPayload, waitForResponse = Some(timeout), cause) map {
+            case res => (res, accounting.atomicActionCnt + 1)
+          }
         case None =>
           val SequenceExecMetaData(components) = action.exec
           logging.debug(this, s"sequence invoking an enclosed sequence $action")

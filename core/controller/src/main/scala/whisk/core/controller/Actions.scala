@@ -445,6 +445,11 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         checkSequenceActionLimits(entityName, seq.components) map { _ =>
           makeWhiskAction(content.replace(seq), entityName)
         }
+      //~ case seq: ProjectionExec =>
+        //~ // check that the sequence conforms to max length and no recursion rules
+        //~ checkSequenceActionLimits(entityName, seq.components) map { _ =>
+          //~ makeWhiskAction(content.replace(seq), entityName)
+        //~ }
       case supportedExec if !supportedExec.deprecated =>
         Future successful makeWhiskAction(content, entityName)
       case deprecatedExec =>
@@ -502,16 +507,28 @@ trait WhiskActionsApi extends WhiskCollectionAPI with PostActionActivation with 
         Parameters("_actions", JsArray(seq.components map { c =>
           JsString("/" + c.toString)
         }))
+      case seq: ForkExec =>
+        Parameters("_actions", JsArray(seq.components map { c =>
+          JsString("/" + c.toString)
+        }))
+      //~ case seq: ProjectionExec =>
+        //~ Parameters("_actions", JsArray(seq.components map { c =>
+          //~ JsString("/" + c.toString)
+        //~ }))
       case _ =>
         content.parameters getOrElse {
           action.exec match {
             case seq: SequenceExec => Parameters()
+            //~ case seq: ProjectionExec => Parameters()
+            case seq: ForkExec => Parameters()
             case _                 => action.parameters
           }
         }
     } getOrElse {
       action.exec match {
         case seq: SequenceExec => action.parameters // discard content.parameters
+        //~ case seq: ProjectionExec => action.parameters
+        case seq: ForkExec => action.parameters
         case _                 => content.parameters getOrElse action.parameters
       }
     }
