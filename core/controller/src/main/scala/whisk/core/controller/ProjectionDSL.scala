@@ -6,6 +6,8 @@
 import scala.util.parsing.combinator._
 import scala.util.parsing.input.Positional
 import scala.util.parsing.input.{NoPosition, Position, Reader}
+import spray.json._
+import DefaultJsonProtocol._ 
 
 sealed trait Token extends Positional
 class ConstantToken extends Token
@@ -90,22 +92,22 @@ trait Expression extends ASTNode
 trait Pattern extends ASTNode
 trait Constant extends Expression
 
-case class NumberConstant (num : String) extends Constant
-case class BoolConstant (bool : String) extends Constant
+case class NumberConstant (num : Int) extends Constant
+case class BoolConstant (bool : Boolean) extends Constant
 case class StringConstant (str : String) extends Constant
 case object NullConstant extends Constant
 
-case class KeyValuePair (key: StringConstant, value: Expression) extends ASTNode
-case class Identifier (id: String) extends ASTNode
+case class KeyValuePair (key: String, value: Expression) extends ASTNode
+case class Identifier (id: String) extends Pattern
 
 case class ArrayExpression (expressions : List [Expression]) extends Expression
 case class JsonObjectExpression (map : List[KeyValuePair]) extends Expression
 case class PatternExpression (pattern: Pattern) extends Expression
 case class EmptyPatternExpression() extends Expression
 
-case class ArrayIndexPattern (index : NumberConstant) extends Pattern
-case class FieldPattern (field : Identifier) extends Pattern
-case class StringPattern (str : StringConstant) extends Pattern
+case class ArrayIndexPattern (index : Int) extends Pattern
+case class FieldPattern (field : String) extends Pattern
+case class StringPattern (str : String) extends Pattern
 case class ContinuousPatterns (pattern1 : Pattern, pattern2: Pattern) extends Pattern
 case class DotPattern (pattern: Pattern) extends Pattern
 
@@ -131,7 +133,7 @@ object DSLParser extends Parsers {
   }
   
   def numberConstant : Parser[NumberConstant] = {
-    accept ("number", {case n @ NumberToken (num) => NumberConstant (num)})
+    accept ("number", {case n @ NumberToken (num) => NumberConstant (num.toInt)})
   }
   
   def commaSeparatorASTNode : Parser[CommaSeparatorASTNode] = {
@@ -163,23 +165,23 @@ object DSLParser extends Parsers {
   }
   
   def fieldPattern : Parser[FieldPattern] = {
-    (identifier) ^^ {case (i @ Identifier(id)) => FieldPattern (i)}
+    (identifier) ^^ {case (i @ Identifier(id)) => FieldPattern (id)}
   }
   
   def stringPattern : Parser[StringPattern] = {
     (bigBraceStartASTNode ~ stringConstant ~ bigBraceEndASTNode) ^^ {
-      case sbrace ~ str ~ ebrace => StringPattern (str)
+      case sbrace ~ StringConstant(str) ~ ebrace => StringPattern (str)
     }
   }
   
   def arrayIndexPattern : Parser[ArrayIndexPattern] = {
     (bigBraceStartASTNode ~ numberConstant ~ bigBraceEndASTNode) ^^ {
-      case sbrace ~ n ~ ebrace => ArrayIndexPattern (n)
+      case sbrace ~ NumberConstant(n) ~ ebrace => ArrayIndexPattern (n.toInt)
     }
   }
   
   def keyValuePair : Parser[KeyValuePair] = {
-    (stringConstant ~ keyValueSeparatorASTNode ~ expression) ^^ {case str ~ sep ~ exp => KeyValuePair (str, exp)}
+    (stringConstant ~ keyValueSeparatorASTNode ~ expression) ^^ {case StringConstant(str) ~ sep ~ exp => KeyValuePair (str, exp)}
   }
   
   def arrayExpression : Parser[ArrayExpression] = {
@@ -233,19 +235,85 @@ object DSLParser extends Parsers {
   }
 }
 
-object HelloWorld {
-    def example() = {
-      //val q = """{"x":1, "y":22}"""
-      val q = """[1,2,3,4,5]"""
-      //val q = """.[0]"""
-      //val q = """."""
-      //val q = """.[0].[1].[2].id.["xx"]"""
-      System.out.println (q)
-        val l = Tokenizer (q)
-        System.out.println (l)
-        System.out.println (l match {
-          case Right (t) => DSLParser (t)
-          case Left (t) => t
-        })
+class DSLInterpreterException (private val msg: String, private val cause: Throwable = None.orNull) extends Exception (msg, cause)
+
+object DSLInterpreter {
+  def apply (astNode : ASTNode, jsValue : JsValue) : JsValue = {
+    astNode match {
+      case exp : Expression => interpretExpression (exp, jsValue)
+      //case pat : Pattern => interpretPattern (pat, jsObject)
+      case _ => throw new IllegalArgumentException ("Not handling this ASTNode in interpreter $astNode")
     }
+  }
+  
+  def interpretExpression (expr : Expression, jsObject: JsValue) : JsValue = {
+    expr match {
+      case NumberConstant (num) => JsNumber (num)
+      case StringConstant (str) => JsString (str)
+      case BoolConstant (bool) => JsBoolean (bool)
+      case NullConstant => JsNull
+      case ArrayExpression (exprs) => JsArray (exprs.map (expr => interpretExpression(expr, jsObject)))
+      case JsonObjectExpression (keyVals) => {
+        val map : Map [String, JsValue] = keyVals.map {case KeyValuePair (key, expr) => (key, interpretExpression (expr, jsObject))}.toMap
+        JsObject (map)
+      }
+      case PatternExpression (pattern) => interpretPattern (pattern, jsObject)
+      case EmptyPatternExpression () => jsObject
+      case _ => throw new IllegalArgumentException ("Not handling this expression") 
+    }
+  }
+  
+  private def jsValueToJsObject (jsValue: JsValue) : JsObject = {
+    try {
+      jsValue.asInstanceOf[JsObject]
+    }
+    catch {
+      case e : Exception => throw new DSLInterpreterException (s"Cannot convert $jsValue to JsObject")
+    }
+  }
+  
+  def interpretPattern (pat: Pattern, jsValue: JsValue) : JsValue = {
+    pat match {
+      //~ case Identifier (id) => {
+        //~ val JsObject (mapJsObject : Map[String, JsValue]) = jsValueToJsObject (jsValue)
+        //~ if (!(mapJsObject contains id)) {
+          //~ throw new DSLInterpreterException (s"$id not found in JsObject $jsValue")
+        //~ }
+        //~ mapJsObject (id)
+      //~ }
+      case ArrayIndexPattern (index) => {
+        try {
+          val jsArray = jsValue.asInstanceOf [JsArray]
+          val JsArray (elements) = jsArray
+          elements (index)
+        }
+        catch {
+          case ex : java.lang.ClassCastException => throw new DSLInterpreterException (s"$jsValue is not Array. Error interpreting ArrayIndexPattern($index)")
+        }
+      }
+      
+      case FieldPattern (field) => {
+        val JsObject (mapJsObject : Map[String, JsValue]) = jsValueToJsObject (jsValue)
+        try {
+          mapJsObject (field)
+        }
+        catch {
+          case e: Exception => throw new DSLInterpreterException (s"Field $field not present in JsObject $mapJsObject")
+        }
+      }
+      
+      case StringPattern (str) => {
+        val JsObject (mapJsObject : Map[String, JsValue]) = jsValueToJsObject (jsValue)
+        try {
+          mapJsObject (str)
+        }
+        catch {
+          case e: Exception => throw new DSLInterpreterException (s"StringPattern $str not present in JsObject $mapJsObject")
+        }
+      }
+      case ContinuousPatterns (pattern1, pattern2) => interpretPattern (pattern2, interpretPattern (pattern1, jsValue))
+      case DotPattern (pattern) => interpretPattern (pattern, jsValue)
+      case _ => throw new IllegalArgumentException ("Not handling this pattern") 
+    }
+  }
 }
