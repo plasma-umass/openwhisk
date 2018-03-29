@@ -3,11 +3,12 @@
 //complexPat ::= simplePat | simplePat . complexPat
 //simplePat ::= [n] | id | [str]
 
+package whisk.core.controller
+
 import scala.util.parsing.combinator._
 import scala.util.parsing.input.Positional
 import scala.util.parsing.input.{NoPosition, Position, Reader}
 import spray.json._
-import DefaultJsonProtocol._ 
 
 sealed trait Token extends Positional
 class ConstantToken extends Token
@@ -27,7 +28,7 @@ case object CommaSeparator extends Token
 case class IdentifierToken (id: String) extends Token
 
 trait ParsingError
-case class TokenizerError(msg: String) extends ParsingError
+case class TokenizerError(msg: String, private val cause: Throwable = None.orNull) extends Exception ("Tokenization Failed: " + msg, cause)
 
 object Tokenizer extends RegexParsers {
   
@@ -73,6 +74,7 @@ object Tokenizer extends RegexParsers {
   }
   
   def apply(code: String): Either [TokenizerError, List[Token]] = {
+    System.out.println ("Doing Tokenization of code " + code)
     parse (tokens, code) match {
       case NoSuccess(msg, next) => Left(TokenizerError (msg))
       case Success(result, next) => Right (result)
@@ -119,7 +121,7 @@ case class PatternDotASTNode () extends ASTNode //.
 case class KeyValueSeparatorASTNode () extends ASTNode //:
 case class CommaSeparatorASTNode () extends ASTNode //:
 
-case class DSLParsingError(msg: String) extends ParsingError
+case class DSLParsingError(msg: String, private val cause: Throwable = None.orNull) extends Exception ("Parsing Failed: " + msg, cause)
 
 object DSLParser extends Parsers {
   override type Elem = Token
@@ -237,8 +239,22 @@ object DSLParser extends Parsers {
 
 class DSLInterpreterException (private val msg: String, private val cause: Throwable = None.orNull) extends Exception (msg, cause)
 
-object DSLInterpreter {
-  def apply (astNode : ASTNode, jsValue : JsValue) : JsValue = {
+sealed class ProjectionDSL () {
+  def apply (code : String, jsValue : JsValue) : JsValue = {
+    val lexerResult = Tokenizer (code)
+    val tokens = lexerResult match {
+      case Right(t) => t
+      case Left(m) => throw m
+    }
+    
+    System.out.println (s"Tokens are $tokens")
+    val astNode = DSLParser (tokens) match {
+      case Right(t) => t
+      case Left(m) => throw m
+    } 
+    
+    System.out.println (s"ASTNode after parsing is $astNode")
+    
     astNode match {
       case exp : Expression => interpretExpression (exp, jsValue)
       //case pat : Pattern => interpretPattern (pat, jsObject)
@@ -252,7 +268,7 @@ object DSLInterpreter {
       case StringConstant (str) => JsString (str)
       case BoolConstant (bool) => JsBoolean (bool)
       case NullConstant => JsNull
-      case ArrayExpression (exprs) => JsArray (exprs.map (expr => interpretExpression(expr, jsObject)))
+      case ArrayExpression (exprs) => JsArray ((exprs.map (expr => interpretExpression(expr, jsObject))).toVector)
       case JsonObjectExpression (keyVals) => {
         val map : Map [String, JsValue] = keyVals.map {case KeyValuePair (key, expr) => (key, interpretExpression (expr, jsObject))}.toMap
         JsObject (map)

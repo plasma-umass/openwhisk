@@ -30,6 +30,7 @@ import whisk.core.database.{ActivationStore, NoDocumentException, UserContext}
 import whisk.core.entitlement.{Resource, _}
 import whisk.core.entity.ActivationResponse.ERROR_FIELD
 import whisk.core.entity._
+import whisk.core.controller.ProjectionDSL
 import whisk.core.entity.size.SizeInt
 import whisk.core.entity.types.EntityStore
 import whisk.http.Messages._
@@ -214,7 +215,7 @@ protected[actions] trait PrimitiveActions {
       val ProjectionExecMetaData(code) = action.exec
       System.out.println (s"invokeProjection:179 code is $code")
       System.out.println (s"invokeProjection:179 updatedPayload is $updatedPayload")
-      
+      val dslResult = (new ProjectionDSL).apply(code, updatedPayload)
       val end = Instant.now(Clock.systemUTC())
   
       // create the whisk activation

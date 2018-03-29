@@ -225,18 +225,18 @@ protected[core] case class SequenceExecMetaData(components: Vector[FullyQualifie
   override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
 }
 
-protected[core] case class ProjectionExecMetaData(schemaCode: String) extends ExecMetaDataBase {
+protected[core] case class ProjectionExecMetaData(code: String) extends ExecMetaDataBase {
   override val kind = ExecMetaDataBase.PROJECTION
   override val deprecated = false  
   //override def size = action.size
-  override def size = schemaCode.sizeInBytes
+  override def size = code.sizeInBytes
 }
 
-protected[core] case class ProjectionExec (schemaCode: String) extends Exec {
+protected[core] case class ProjectionExec (code: String) extends Exec {
   override val kind = Exec.PROJECTION
   override val deprecated = false
   //override def size = action.size
-  override def size = schemaCode.sizeInBytes
+  override def size = code.sizeInBytes
 }
 
 protected[core] case class ForkExecMetaData(components: Vector[FullyQualifiedEntityName]) extends ExecMetaDataBase {
@@ -286,8 +286,8 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
       case s @ SequenceExec(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
       
-      case p @ ProjectionExec(schemaCode) =>
-        JsObject("kind" -> JsString(p.kind), "schemaCode" -> JsString(schemaCode))
+      case p @ ProjectionExec(code) =>
+        JsObject("kind" -> JsString(p.kind), "code" -> JsString(code))
         //"action" -> action.qualifiedNameWithLeadingSlash.toJson, 
       
       case f @ ForkExec(comp) => 
@@ -331,7 +331,12 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
         
         case Exec.PROJECTION =>
           //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
-          val schemaCode = obj.fields.get("schemaCode").toString
+          val schemaCode : String = obj.fields.get("code") match {
+            case Some(JsString(t)) => t
+            case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
+            case None => "."
+          }
+          System.out.println (s"schemaCode:322 = $schemaCode")
           ProjectionExec(schemaCode)
         
         case Exec.FORK =>
@@ -442,9 +447,9 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
       case s @ SequenceExecMetaData(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
       
-      case p @ ProjectionExecMetaData(schemaCode) =>
+      case p @ ProjectionExecMetaData(code) =>
         JsObject("kind" -> JsString(p.kind), //"action" -> action.qualifiedNameWithLeadingSlash.toJson, 
-                 "schemaCode" -> JsString(schemaCode))
+                 "code" -> JsString(code))
       case f @ ForkExecMetaData (comp) => 
         JsObject("kind" -> JsString(f.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
       case b: BlackBoxExecMetaData =>
@@ -492,7 +497,12 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           //  case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
           //  case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
           //}
-          val schemaCode = obj.fields.get("schemaCode").toString
+          val schemaCode : String = obj.fields.get("code") match {
+            case Some(JsString(i)) => i
+            case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
+            case None => "."
+          }
+          System.out.println(s"schemaCode:481 = $schemaCode")
           ProjectionExecMetaData(schemaCode)
         
         case Exec.FORK =>
