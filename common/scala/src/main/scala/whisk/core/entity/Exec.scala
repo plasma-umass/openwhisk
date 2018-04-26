@@ -226,6 +226,19 @@ protected[core] case class ProjectionExec (code: String) extends Exec {
   override def size = code.sizeInBytes
 }
 
+protected[core] case class AppExecMetaData() extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.APP
+  override val deprecated = false
+  override def size = 0.B
+}
+
+protected[core] case class AppExec () extends Exec {
+  override val kind = Exec.APP
+  override val deprecated = false
+  override def size = 0.B
+}
+
+
 protected[core] case class ForkExecMetaData(components: Vector[FullyQualifiedEntityName]) extends ExecMetaDataBase {
   override val kind = ExecMetaDataBase.FORK
   override val deprecated = false  
@@ -251,6 +264,7 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
   protected[core] val BLACKBOX = "blackbox"
   protected[core] val PROJECTION = "projection"
   protected[core] val FORK = "fork"
+  protected[core] val APP = "app"
   
   private def execManifests = ExecManifest.runtimesManifest
 
@@ -280,7 +294,9 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
       case f @ ForkExec(comp) => 
         JsObject("kind" -> JsString(f.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
                  
-      
+      case a @ AppExec() =>
+        JsObject("kind" -> JsString(a.kind))
+        
       case b: BlackBoxExec =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
@@ -333,6 +349,9 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
             case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
           }
           ForkExec (comp)
+        
+        case Exec.APP =>
+          AppExec()
           
         case Exec.BLACKBOX =>
           val image: ImageName = obj.fields.get("image") match {
@@ -409,6 +428,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
   protected[core] val BLACKBOX = "blackbox"
   protected[core] val PROJECTION = "projection"
   protected[core] val FORK = "fork"
+  protected[core] val APP = "app"
   
   private def execManifests = ExecManifest.runtimesManifest
 
@@ -436,6 +456,9 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
                  "code" -> JsString(code))
       case f @ ForkExecMetaData (comp) => 
         JsObject("kind" -> JsString(f.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      case a @ AppExecMetaData () =>
+        JsObject("kind" -> JsString(a.kind))
+        
       case b: BlackBoxExecMetaData =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
@@ -474,7 +497,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           }
           SequenceExecMetaData(comp)
         
-        case Exec.PROJECTION =>
+        case ExecMetaDataBase.PROJECTION =>
           //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
           //val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
           //  case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
@@ -489,7 +512,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           System.out.println(s"schemaCode:481 = $schemaCode")
           ProjectionExecMetaData(schemaCode)
         
-        case Exec.FORK =>
+        case ExecMetaDataBase.FORK =>
           val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
             case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
             case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
@@ -497,6 +520,8 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           }
           
           ForkExecMetaData (comp)
+        case ExecMetaDataBase.APP =>
+          AppExecMetaData ()
           
         case ExecMetaDataBase.BLACKBOX =>
           val image: ImageName = obj.fields.get("image") match {
