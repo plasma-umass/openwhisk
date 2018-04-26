@@ -51,6 +51,9 @@ protected[core] trait PostActionActivation extends PrimitiveActions with Sequenc
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
     action.toExecutableWhiskAction match {
+      case None if action.exec.isInstanceOf[AppExecMetaData] =>
+        System.out.println ("PostActionActivation: invokeApp")
+        invokeApp(user, action, payload, waitForResponse, cause)
       case None if action.exec.isInstanceOf[ProjectionExecMetaData] =>
         System.out.println ("PostActionActivation: invokeProjection")
         val ProjectionExecMetaData(code) = action.exec

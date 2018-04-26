@@ -89,6 +89,65 @@ protected[actions] trait PrimitiveActions {
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]]
   
+  protected[actions] def invokeApp(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+      System.out.println (s"invoke app")      
+  
+      val JsObject(payloadMap) = payload.getOrElse(JsObject.empty)
+      var newPayload  = JsObject.empty
+      var nextAction = JsString.empty
+      if (payloadMap contains "action") {
+        nextAction = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
+      }
+      else {
+        throw new Exception("No next action available", None.orNull)
+      }
+      
+      if (payloadMap contains "input") {
+        newPayload = (payloadMap getOrElse ("input", JsObject.empty)).asJsObject
+      }
+      else {
+        throw new Exception("No input to the action", None.orNull)
+      }
+      System.out.println (s"invokeApp: nextAction is $nextAction, input is $newPayload")
+      var nextActionVector: Vector[JsValue] = Vector[JsValue](nextAction)
+      nextActionVector = nextAction +: nextActionVector
+      val components: Vector[FullyQualifiedEntityName] = nextActionVector map (FullyQualifiedEntityName.serdes.read(_))
+            
+      val next = components (0).fullPath
+      // resolve and invoke next action
+      val fqn = (if (next.defaultPackage) EntityPath.DEFAULT.addPath(next) else next)
+        .resolveNamespace(user.namespace)
+        .toFullyQualifiedEntityName
+      val resource = Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString))
+      entitlementProvider
+        .check(user, Privilege.ACTIVATE, Set(resource), noThrottle = true)
+        .flatMap { _ =>
+          // successful entitlement check
+          WhiskActionMetaData
+            .resolveActionAndMergeParameters(entityStore, fqn)
+            .flatMap {
+              case next =>
+                // successful resolution
+                invokeAction(user, next, Option(newPayload), waitForResponse, cause)
+            }
+            //~ .recover {
+              //~ case _ =>
+                //~ // resolution failure
+                //~ ActivationResponse.applicationError(compositionComponentNotFound(next.asString))
+            //~ }
+        }
+        //~ .recover {
+          //~ case _ =>
+            //~ // failed entitlement check
+            //~ ActivationResponse.applicationError(compositionComponentNotAccessible(next.asString))
+        //~ }
+  }
+  
   protected[actions] def invokeFork(
     user: Identity,
     action: WhiskActionMetaData,
@@ -227,7 +286,7 @@ protected[actions] trait PrimitiveActions {
         start = start,
         end = end,
         cause = cause,
-        response = ActivationResponse.success(Option(JsObject(newMap))),
+        response = ActivationResponse.success(Option(dslResult)),
         version = action.version,
         publish = false,
         //~ annotations = Parameters(WhiskActivation.topmostAnnotation, JsBoolean(session.cause.isEmpty)) ++
