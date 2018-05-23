@@ -1,5 +1,5 @@
 //Grammar
-//e ::= c | [e1, e2, ..., en] | {str1: e1, ..., strn:en} | .complexPat | . | e1 == e2 | e1 != e2 | if e1 then e2 else e3
+//e ::= c | [e1, e2, ..., en] | {str1: e1, ..., strn:en} | .complexPat | . | (e) | e1 * e2 | e1 == e2 | e1 != e2 | if e1 then e2 else e3
 //complexPat ::= simplePat | simplePat . complexPat
 //simplePat ::= [n] | id | [str]
 
@@ -22,6 +22,9 @@ case object BigBraceStart extends Token // [
 case object BigBraceEnd extends Token // ]
 case object CurlyBraceStart extends Token // {
 case object CurlyBraceEnd extends Token // }
+case object BracketStart extends Token // (
+case object BracketEnd extends Token // )
+case object UnionOperatorToken extends Token //*
 case object PatternDot extends Token //.
 case object KeyValueSeparator extends Token //:
 case object CommaSeparator extends Token
@@ -42,6 +45,9 @@ object Tokenizer extends RegexParsers {
   def bigBraceEnd = "]" ^^ {_ => BigBraceEnd}
   def curlyBraceStart = "{" ^^ {_ => CurlyBraceStart}
   def curlyBraceEnd = "}" ^^ {_ => CurlyBraceEnd}
+  def bracketStart = "(" ^^ {_ => BracketStart}
+  def bracketEnd = ")" ^^ {_ => BracketEnd}
+  def unionOperator = "*" ^^ {_ => UnionOperatorToken}
   def patternDot = "." ^^ {_ => PatternDot}
   def keyValueSeparator = ":" ^^ {_ => KeyValueSeparator}
   def commaSeparator = "," ^^ {_ => CommaSeparator}
@@ -80,6 +86,8 @@ object Tokenizer extends RegexParsers {
   def tokens:Parser[List[Token]] = {
     phrase (rep1 (bigBraceStart   | bigBraceEnd       | 
                   curlyBraceStart | curlyBraceEnd     |
+                  bracketStart    | bracketEnd        |
+                  unionOperator   |
                   patternDot      | keyValueSeparator |
                   stringToken     | numberToken       | 
                   booleanToken    | nullToken         |
@@ -115,16 +123,17 @@ class TokenReader (tokens: List[Token]) extends Reader[Token] {
 
 object Operator extends Enumeration {
   type Operator = Value
-  val IsEqual, IsNotEqual = Value
+  val IsEqual, IsNotEqual, Union = Value
 }
 
 trait ASTNode
 trait Expression extends ASTNode
 trait Pattern extends ASTNode
 trait Constant extends Expression
-class ConditionalOperator (op: Operator.Value) extends ASTNode {
+class Operator (op: Operator.Value) extends ASTNode {
   def getOperator = op
 }
+class BinaryOperator (op: Operator.Value) extends Operator (op)
 
 case class NumberConstant (num : Int) extends Constant
 case class BoolConstant (bool : Boolean) extends Constant
@@ -134,13 +143,11 @@ case class NullConstant () extends Constant
 case class KeyValuePair (key: String, value: Expression) extends ASTNode
 case class Identifier (id: String) extends Pattern
 
-case class ConditionalExpression (exp1 : Expression, op: ConditionalOperator, exp2 : Expression) extends Expression
+case class BinaryOperatorExpression (exp1 : Expression, op: Operator, exp2 : Expression) extends Expression
 case class ArrayExpression (expressions : List [Expression]) extends Expression
 case class JsonObjectExpression (map : List[KeyValuePair]) extends Expression
 case class PatternExpression (pattern: Pattern) extends Expression
 case class EmptyPatternExpression() extends Expression
-case class IsEqualExpression(exp1 : Expression, exp2 : Expression) extends Expression
-case class IsNotEqualExpression(exp1 : Expression, exp2 : Expression) extends Expression
 case class IfThenElseExpression(cond : Expression, thenExp : Expression, elseExp : Expression) extends Expression
 
 case class ArrayIndexPattern (index : Int) extends Pattern
@@ -153,14 +160,17 @@ case class BigBraceStartASTNode () extends ASTNode // [
 case class BigBraceEndASTNode () extends ASTNode // ]
 case class CurlyBraceStartASTNode () extends ASTNode // {
 case class CurlyBraceEndASTNode () extends ASTNode // }
+case class BracketStartASTNode () extends ASTNode // (
+case class BracketEndASTNode () extends ASTNode // )
 case class PatternDotASTNode () extends ASTNode //.
 case class KeyValueSeparatorASTNode () extends ASTNode //:
 case class CommaSeparatorASTNode () extends ASTNode //:
 case class IfASTNode() extends ASTNode
 case class ThenASTNode() extends ASTNode
 case class ElseASTNode() extends ASTNode
-case class IsEqualOperator() extends ConditionalOperator (Operator.IsEqual)
-case class IsNotEqualOperator() extends ConditionalOperator (Operator.IsNotEqual)
+case class IsEqualOperator() extends BinaryOperator (Operator.IsEqual)
+case class IsNotEqualOperator() extends BinaryOperator (Operator.IsNotEqual)
+case class UnionOperator () extends BinaryOperator (Operator.Union)
 
 case class DSLParsingError(msg: String, private val cause: Throwable = None.orNull) extends Exception ("Parsing Failed: " + msg, cause)
 
@@ -207,6 +217,14 @@ object DSLParser extends PackratParsers {
     accept ("}", {case CurlyBraceEnd => CurlyBraceEndASTNode ()})
   }
   
+  lazy val bracketStartASTNode : PackratParser[BracketStartASTNode] = {
+    accept ("}", {case BracketStart => BracketStartASTNode ()})
+  }
+  
+  lazy val bracketEndASTNode : PackratParser[BracketEndASTNode] = {
+    accept ("}", {case BracketEnd => BracketEndASTNode ()})
+  }
+  
   lazy val patternDotASTNode : PackratParser[PatternDotASTNode] = {
     accept (".", {case PatternDot => PatternDotASTNode ()})
   }
@@ -235,13 +253,23 @@ object DSLParser extends PackratParsers {
     accept ("!=", {case IsNotEqualToken => IsNotEqualOperator()})
   }
   
-  lazy val conditionalOperator : PackratParser[ConditionalOperator] = {
-    isEqualOperator | isNotEqualOperator
+  lazy val binaryOperator : PackratParser[BinaryOperator] = {
+    isEqualOperator | isNotEqualOperator | unionOperator
   }
 
-  lazy val conditionalExpression : PackratParser[ConditionalExpression] = {
-    (expression ~ conditionalOperator ~ expression) ^^ {
-      case exp1 ~ op ~ exp2 => ConditionalExpression (exp1, op, exp2)
+  lazy val unionOperator : PackratParser[UnionOperator] = {
+    accept ("*", {case UnionOperatorToken => UnionOperator ()})
+  }
+  
+  lazy val bracketExpression : PackratParser[Expression] = {
+    (bracketStartASTNode ~ expression ~ bracketEndASTNode) ^^ {
+      case _ ~ exp ~ _ => exp
+    }
+  }
+  
+  lazy val binaryOperatorExpression : PackratParser[BinaryOperatorExpression] = {
+    (expression ~ binaryOperator ~ expression) ^^ {
+      case exp1 ~ op ~ exp2 => BinaryOperatorExpression (exp1, op, exp2)
     }
   }
   
@@ -260,7 +288,7 @@ object DSLParser extends PackratParsers {
       case sbrace ~ NumberConstant(n) ~ ebrace => ArrayIndexPattern (n.toInt)
     }
   }
-  
+
   lazy val keyValuePair : PackratParser[KeyValuePair] = {
     (stringConstant ~ keyValueSeparatorASTNode ~ expression) ^^ {case StringConstant(str) ~ sep ~ exp => KeyValuePair (str, exp)}
   }
@@ -296,14 +324,11 @@ object DSLParser extends PackratParsers {
   }
   
   lazy val expression : PackratParser[Expression] = {
-    ifThenElseExpression |
-    log(conditionalExpression) ("conditionalExpression")|
-    log (patternExpression) ("patternExpression")|
-    stringConstant |
-    boolConstant | nullConstant |
-    log (numberConstant) ("numberConstant") |
-    arrayExpression|
-    jsonObjectExpression |
+    bracketExpression        | ifThenElseExpression     | 
+    binaryOperatorExpression | patternExpression        |
+    stringConstant           | boolConstant             | 
+    nullConstant             | numberConstant           | 
+    arrayExpression          | jsonObjectExpression     | 
     emptyPatternExpression
   }
   
@@ -365,12 +390,32 @@ sealed class ProjectionDSL () {
         val map : Map [String, JsValue] = keyVals.map {case KeyValuePair (key, expr) => (key, interpretExpression (expr, jsObject))}.toMap
         JsObject (map)
       }
-      case ConditionalExpression (e1, op, e2) => {
+      case BinaryOperatorExpression (e1, op, e2) => {
         val ret1 = interpretExpression (e1, jsObject)
         val ret2 = interpretExpression (e2, jsObject)
         op.getOperator match {
           case Operator.IsEqual => if (ret1 == ret2) JsTrue else JsFalse 
           case Operator.IsNotEqual => if (ret1 != ret2) JsTrue else JsFalse
+          case Operator.Union => { 
+            var ret1JsObject : JsObject = null
+            var ret2JsObject : JsObject = null
+            
+            try {
+              ret1JsObject = ret1.asJsObject
+            } catch {
+              case e: Exception => throw new IllegalArgumentException (s"First argument to Union operator $ret1 is not JsObject")
+            }
+            
+            try {
+              ret2JsObject = ret2.asJsObject
+            } catch {
+              case e: Exception => throw new IllegalArgumentException (s"Second argument to Union operator $ret2 is not JsObject")
+            }
+            
+            val JsObject (ret1Map) = ret1JsObject
+            val JsObject (ret2Map) = ret2JsObject
+            JsObject(ret1Map ++ ret2Map)
+          }
         }        
       }
       case IfThenElseExpression(condExp, exp1, exp2) => {

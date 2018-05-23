@@ -139,7 +139,9 @@ protected[actions] trait PrimitiveActions {
             .flatMap {
               case next =>
                 // successful resolution
-                invokeAction(user, next, Option(newPayload), waitForResponse, cause)
+                val a = invokeAction(user, next, Option(newPayload), waitForResponse, cause)
+                System.out.println ("invoked action by App, returned $a")
+                a
             }
             //~ .recover {
               //~ case _ =>
