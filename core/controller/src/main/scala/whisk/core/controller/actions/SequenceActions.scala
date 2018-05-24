@@ -349,7 +349,6 @@ protected[actions] trait SequenceActions {
     var resolved = resolvedFutureActions map { e => e}
     var result : Future[SequenceAccounting] = null
     var iter : Int = 0
-    var iterations = 0
     System.out.println (s"Starting program $seqAction.")
     System.out.println (s"Size of resolved actions " + resolvedFutureActions.size)
     System.out.println (s"resolved: $resolved")
@@ -404,8 +403,7 @@ protected[actions] trait SequenceActions {
           val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
           result = Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
         }      
-      iterations += 1
-    } while (iterations < 5 && iter != -1)
+    } while (iter != -1)
     
     System.out.println (s"Final result $result")
     Await.ready (result, Duration.Inf)
