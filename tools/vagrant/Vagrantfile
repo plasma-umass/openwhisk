@@ -17,7 +17,7 @@ OW_DB = if ENV['OW_DB'] =~ (/^(cloudant|couchdb)$/i) then true else false end
 Vagrant.configure('2') do |config|
   config.vm.box = BOX
   config.vm.network :private_network, ip: MACHINE_IP
-
+  Vagrant::DEFAULT_SERVER_URL.replace('https://vagrantcloud.com')
   # If true, then any SSH connections made will enable agent forwarding.
   # Default value: false
   config.ssh.forward_agent = true

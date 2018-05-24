@@ -226,6 +226,18 @@ protected[core] case class ProjectionExec (code: String) extends Exec {
   override def size = code.sizeInBytes
 }
 
+protected[core] case class ProgramExecMetaData (components: Vector[FullyQualifiedEntityName]) extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.PROGRAM
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
+protected[core] case class ProgramExec(components: Vector[FullyQualifiedEntityName]) extends Exec {
+  override val kind = Exec.PROGRAM
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
 protected[core] case class AppExecMetaData() extends ExecMetaDataBase {
   override val kind = ExecMetaDataBase.APP
   override val deprecated = false
@@ -263,6 +275,7 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
   protected[core] val PROJECTION = "projection"
+  protected[core] val PROGRAM = "program"
   protected[core] val FORK = "fork"
   protected[core] val APP = "app"
   
@@ -286,6 +299,11 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
 
       case s @ SequenceExec(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      
+      case s @ ProgramExec(comp) => {
+        System.out.println (s"ProgramExec components $comp")
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      }
       
       case p @ ProjectionExec(code) =>
         JsObject("kind" -> JsString(p.kind), "code" -> JsString(code))
@@ -332,6 +350,14 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
           }
           SequenceExec(comp)
         
+        case Exec.PROGRAM =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ProgramExec(comp)
+          
         case Exec.PROJECTION =>
           //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
           val schemaCode : String = obj.fields.get("code") match {
@@ -427,6 +453,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
   protected[core] val PROJECTION = "projection"
+  protected[core] val PROGRAM = "program"
   protected[core] val FORK = "fork"
   protected[core] val APP = "app"
   
@@ -449,6 +476,9 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
         JsObject(base ++ main)
 
       case s @ SequenceExecMetaData(comp) =>
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      
+      case s @ ProgramExecMetaData(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
       
       case p @ ProjectionExecMetaData(code) =>
@@ -497,6 +527,14 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
           }
           SequenceExecMetaData(comp)
         
+        case ExecMetaDataBase.PROGRAM =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ProgramExecMetaData(comp)
+          
         case ExecMetaDataBase.PROJECTION =>
           //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
           //val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {

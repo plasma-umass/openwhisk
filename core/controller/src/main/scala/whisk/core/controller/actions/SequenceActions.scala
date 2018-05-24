@@ -25,6 +25,7 @@ import scala.collection._
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration._
+import scala.concurrent.Await
 import scala.language.postfixOps
 import scala.util.Failure
 import scala.util.Success
@@ -140,6 +141,64 @@ protected[actions] trait SequenceActions {
     }
   }
 
+  protected[actions] def invokeProgram(
+    user: Identity,
+    action: WhiskActionMetaData,
+    components: Vector[FullyQualifiedEntityName],
+    payload: Option[JsObject],
+    waitForOutermostResponse: Option[FiniteDuration],
+    cause: Option[ActivationId],
+    topmost: Boolean,
+    atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)] = {
+    require(action.exec.kind == Exec.PROGRAM, "this method requires an action program")
+
+    // create new activation id that corresponds to the sequence
+    val seqActivationId = activationIdFactory.make()
+    logging.info(this, s"invoking sequence $action topmost $topmost activationid '$seqActivationId'")
+
+    val start = Instant.now(Clock.systemUTC())
+    val futureSeqResult: Future[(Either[ActivationId, WhiskActivation], Int)] = {
+      // even though the result of completeSequenceActivation is Right[WhiskActivation],
+      // use a more general type for futureSeqResult in case a blocking invoke takes
+      // longer than expected and we must return Left[ActivationId] instead
+      completeSequenceActivation(
+        seqActivationId,
+        // the cause for the component activations is the current sequence
+        invokeProgramComponents(
+          user,
+          action,
+          seqActivationId,
+          payload,
+          components,
+          cause = Some(seqActivationId),
+          atomicActionsCount),
+        user,
+        action,
+        topmost,
+        start,
+        cause)
+    }
+
+    if (topmost) { // need to deal with blocking and closing connection
+      waitForOutermostResponse
+        .map { timeout =>
+          logging.debug(this, s"invoke sequence blocking topmost!")
+          futureSeqResult.withAlternativeAfterTimeout(
+            timeout,
+            Future.successful(Left(seqActivationId), atomicActionsCount))
+        }
+        .getOrElse {
+          // non-blocking sequence execution, return activation id
+          Future.successful(Left(seqActivationId), 0)
+        }
+    } else {
+      // not topmost, no need to worry about terminating incoming request
+      // and this is a blocking activation therefore by definition
+      // Note: the future for the sequence result recovers from all throwable failures
+      futureSeqResult
+    }
+  }
+  
   /**
    * Creates an activation for the sequence and writes it back to the datastore.
    */
@@ -228,7 +287,158 @@ protected[actions] trait SequenceActions {
         sequenceLimits,
       duration = Some(accounting.duration))
   }
+  
+  /**
+   * Invokes the components of a sequence in a blocking fashion.
+   * Returns a vector of successful futures containing the results of the invocation of all components in the sequence.
+   * Unexpected behavior is modeled through an Either with activation(right) or activation response in case of error (left).
+   *
+   * Keeps track of the dynamic atomic action count.
+   * @param user the user invoking the sequence
+   * @param seqAction the sequence invoked
+   * @param seqActivationId the id of the sequence
+   * @param inputPayload the payload passed to the first component in the sequence
+   * @param components the components in the sequence
+   * @param cause the activation id of the sequence that lead to invoking this sequence or None if this sequence is topmost
+   * @param atomicActionCnt the dynamic atomic action count observed so far since the start of the execution of the topmost sequence
+   * @return a future which resolves with the accounting for a sequence, including the last result, duration, and activation ids
+   */
+  private def invokeProgramComponents(
+    user: Identity,
+    seqAction: WhiskActionMetaData,
+    seqActivationId: ActivationId,
+    inputPayload: Option[JsObject],
+    components: Vector[FullyQualifiedEntityName],
+    cause: Option[ActivationId],
+    atomicActionCnt: Int)(implicit transid: TransactionId): Future[SequenceAccounting] = {
 
+    // For each action in the sequence, fetch any of its associated parameters (including package or binding).
+    // We do this for all of the actions in the sequence even though it may be short circuited. This is to
+    // hide the latency of the fetches from the datastore and the parameter merging that has to occur. It
+    // may be desirable in the future to selectively speculate over a smaller number of components rather than
+    // the entire sequence.
+    //
+    // This action/parameter resolution is done in futures; the execution starts as soon as the first component
+    // is resolved.
+    val resolvedFutureActions = resolveDefaultNamespace(components, user) map { c =>
+      WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, c)
+    }
+    
+    var nameToActions : Map[String, Future[WhiskActionMetaData]] = Map ()
+    
+    for (iter <- 0 to components.size - 1) {
+      var actionName : String = components(iter).toString
+      val lastIndex = actionName.lastIndexOf ('/')
+      if (lastIndex != -1) {
+        actionName = actionName.substring (lastIndex + 1)
+      }
+      nameToActions = nameToActions + (actionName -> resolvedFutureActions(iter))
+      Await.ready (resolvedFutureActions(iter), Duration.Inf)
+      System.out.println (s"actionName: $actionName action " + resolvedFutureActions (iter))
+    }
+    
+    Await.ready (resolvedFutureActions(0), Duration.Inf)
+    val firstAction =  resolvedFutureActions(0)
+    // this holds the initial value of the accounting structure, including the input boxed as an ActivationResponse
+    var accounting = SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
+    val initialAccounting = Future.successful {
+      accounting
+    }
+
+    // execute the actions in sequential blocking
+    var resolved = resolvedFutureActions map { e => e}
+    var result : Future[SequenceAccounting] = null
+    var iter : Int = 0
+    var iterations = 0
+    System.out.println (s"Starting program $seqAction.")
+    System.out.println (s"Size of resolved actions " + resolvedFutureActions.size)
+    System.out.println (s"resolved: $resolved")
+    do {
+        if (accounting.atomicActionCnt < actionSequenceLimit) {
+          var nextActionName = ""
+          var nextAction : Future[WhiskActionMetaData] = null
+          if (iter == 0) {
+            nextAction = firstAction
+          } else {
+            val payload = accounting.previousResponse.get().result.map(_.asJsObject)
+            System.out.println (s"payload received $payload")
+            var JsObject (payloadMap) = payload getOrElse (JsObject.empty)
+            if (payloadMap contains "action") {
+              val JsString (_next) = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
+              nextActionName = _next
+              System.out.println (s"nextActionName is $nextActionName")
+            } else {
+              throw new Exception("No next action available", None.orNull)
+            }
+            
+            if (!(nameToActions contains nextActionName))
+              throw new Exception ("Next action " +nextActionName + " not in Program's Basic Blocks", None.orNull)
+            
+            nextAction = nameToActions(nextActionName)
+          }
+  
+          Await.ready (nextAction, Duration.Inf)
+          System.out.println (s"iter $iter nextAction $nextAction")
+          result = invokeNextAction (user, nextAction, accounting, cause).flatMap { _accounting => {
+              accounting = _accounting
+              System.out.println (s"action called at $iter")
+              if (!_accounting.shortcircuit) {
+                System.out.println (s"Called action successfully at $iter : $accounting")
+                Future.successful(_accounting)
+              } else {
+                // this is to short circuit the fold
+                System.out.println ("Error calling action at $iter")
+                iter = -1
+                Future.failed(FailedSequenceActivation(_accounting)) // terminates the fold
+              }
+            }
+          }
+          System.out.println (s"result at $iter is $result")
+          Await.ready (result, Duration.Inf)
+          System.out.println (s"result at $iter is $result")
+          iter += 1
+        } else {
+          iter = -1
+          val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
+          result = Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
+        }      
+      iterations += 1
+    } while (iterations < 5 && iter != -1)
+    
+    System.out.println (s"Final result $result")
+    Await.ready (result, Duration.Inf)
+    System.out.println (s"Final result after awaiting $result")
+    //result
+    result.recoverWith{
+      case FailedSequenceActivation(_acc) => Future.successful(_acc)
+    }
+    
+    //~ resolvedFutureActions
+      //~ .foldLeft(initialAccounting) { (accountingFuture, futureAction) =>
+        //~ accountingFuture.flatMap { accounting =>
+          //~ if (accounting.atomicActionCnt < actionSequenceLimit) {
+            //~ invokeNextAction(user, futureAction, accounting, cause).flatMap { accounting =>
+              //~ if (!accounting.shortcircuit) {
+                //~ Future.successful(accounting)
+              //~ } else {
+                //~ // this is to short circuit the fold
+                //~ Future.failed(FailedSequenceActivation(accounting)) // terminates the fold
+              //~ }
+            //~ }
+          //~ } else {
+            //~ val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
+            //~ Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
+          //~ }
+        //~ }
+      //~ }
+      //~ .recoverWith {
+        //~ // turn the failed accounting back to success; this is the only possible failure
+        //~ // since all throwables are recovered with a failed accounting instance and this is
+        //~ // in turned boxed to FailedSequenceActivation
+        //~ case FailedSequenceActivation(accounting) => Future.successful(accounting)
+      //~ }
+  }
+  
   /**
    * Invokes the components of a sequence in a blocking fashion.
    * Returns a vector of successful futures containing the results of the invocation of all components in the sequence.
