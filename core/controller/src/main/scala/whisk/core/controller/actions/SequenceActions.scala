@@ -368,7 +368,7 @@ protected[actions] trait SequenceActions {
               nextActionName = _next
               System.out.println (s"nextActionName is $nextActionName")
             } else {
-              throw new Exception("No next action available", None.orNull)
+              iter = -1
             }
             
             if (!(nameToActions contains nextActionName))
@@ -376,20 +376,22 @@ protected[actions] trait SequenceActions {
             
             nextAction = nameToActions(nextActionName)
           }
-  
-          Await.ready (nextAction, Duration.Inf)
-          System.out.println (s"iter $iter nextAction $nextAction")
-          result = invokeNextAction (user, nextAction, accounting, cause).flatMap { _accounting => {
-              accounting = _accounting
-              System.out.println (s"action called at $iter")
-              if (!_accounting.shortcircuit) {
-                System.out.println (s"Called action successfully at $iter : $accounting")
-                Future.successful(_accounting)
-              } else {
-                // this is to short circuit the fold
-                System.out.println ("Error calling action at $iter")
-                iter = -1
-                Future.failed(FailedSequenceActivation(_accounting)) // terminates the fold
+          
+          if (iter != -1) {
+            Await.ready (nextAction, Duration.Inf)
+            System.out.println (s"iter $iter nextAction $nextAction")
+            result = invokeNextAction (user, nextAction, accounting, cause).flatMap { _accounting => {
+                accounting = _accounting
+                System.out.println (s"action called at $iter")
+                if (!_accounting.shortcircuit) {
+                  System.out.println (s"Called action successfully at $iter : $accounting")
+                  Future.successful(_accounting)
+                } else {
+                  // this is to short circuit the fold
+                  System.out.println ("Error calling action at $iter")
+                  iter = -1
+                  Future.failed(FailedSequenceActivation(_accounting)) // terminates the fold
+                }
               }
             }
           }
