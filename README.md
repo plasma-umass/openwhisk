@@ -1,3 +1,16 @@
+# Instructions for Deploying OpenWhisk on Docker container
+```
+1. cd tools/ubuntu-setup && ./all.sh 
+2. Make sure you are able to get all running docker container using
+docker ps
+3. If not then add yourself to docker group, and relogin
+sudo usermod -aG docker $USER
+newgrp docker
+bash -l
+4. We will use an ephemeral CouchDB.
+5. 
+```
+
 # OpenWhisk
 To redeploy OpenWhisk execute
 	/gradlew distDocker && cd ansible/ && ansible-playbook -i environments/local openwhisk.yml -e mode=clean && ansible-playbook -i environments/local openwhisk.yml
