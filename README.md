@@ -36,6 +36,13 @@ cd <openwhisk_home>/bin
 #Check if list namespaces contains a guest namespace, otherwise there is something wrong.
 ./wsk -i namespace list
 ```
+# To Redeploy Openwhisk after changing source code or a restart
+```
+cd <openwhisk_home>
+./gradlew distDocker
+cd ansible/ && ansible-playbook -i environments/local openwhisk.yml -e mode=clean 
+ansible-playbook -i environments/local openwhisk.yml
+```
 
 # OpenWhisk
 To redeploy OpenWhisk execute
