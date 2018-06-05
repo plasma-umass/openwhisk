@@ -1,14 +1,40 @@
 # Instructions for Deploying OpenWhisk on Docker container
 ```
-1. cd tools/ubuntu-setup && ./all.sh 
-2. Make sure you are able to get all running docker container using
+#Deployment has been tested on Ubuntu 14.04
+#cd tools/ubuntu-setup && ./all.sh 
+#Make sure you are able to get all running docker container using
 docker ps
-3. If not then add yourself to docker group, and relogin
+#If not then add yourself to docker group, and relogin
 sudo usermod -aG docker $USER
 newgrp docker
 bash -l
-4. We will use an ephemeral CouchDB.
-5. 
+#We will use an ephemeral CouchDB.
+#Compile OpenWhisk
+cd <home_openwhisk>
+./gradlew distDocker
+sudo apt-get install python-pip
+sudo pip install ansible==2.3.0.0
+sudo pip install jinja2==2.9.6
+printf "systemProp.http.proxyHost=localhost \n systemProp.http.proxyPort=3128" | cat > ~/.gradle/gradle.properties
+cd ansible
+#We will use local environment, hence, no need to provide a new environment explicitly.
+ansible-playbook setup.yml
+ansible-playbook prereq.yml
+ansible-playbook couchdb.yml
+ansible-playbook initdb.yml
+ansible-playbook wipe.yml
+ansible-playbook apigateway.yml
+ansible-playbook openwhisk.yml
+ansible-playbook postdeploy.yml
+#Check that different docker containers are running using
+docker ps
+#Go to directory where CLI Binaries are
+cd <openwhisk_home>/bin
+#Set 172.17.0.1 as api host address and auth key
+./wsk property set --apihost 172.17.0.1 --auth `./wsk property get --auth`
+#Auth key can be manually setup to 23bc46b1-71f6-4ed5-8c54-816aa4f8c502:123zO3xZCLrMN6v2BKK1dXYFpXlPkccOFqm12CdAsMgRU4VrNZ9lyGVCGuMDGIwP
+#Check if list namespaces contains a guest namespace, otherwise there is something wrong.
+./wsk -i namespace list
 ```
 
 # OpenWhisk
