@@ -314,7 +314,7 @@ object DSLParser extends PackratParsers {
   //~ }
   
   lazy val continuousPatterns : PackratParser[ContinuousPatterns] = {
-    (log(simplePattern)("simplePatternInContinuousPattern") ~ log(patternDotASTNode)("patternDot") ~ log(complexPattern)("complexPattern")) ^^ { case pat1 ~ dot ~ pat2 => ContinuousPatterns (pat1, pat2)}
+    (simplePattern ~ patternDotASTNode ~ complexPattern) ^^ { case pat1 ~ dot ~ pat2 => ContinuousPatterns (pat1, pat2)}
   }
   
   lazy val ifThenElseExpression : PackratParser[IfThenElseExpression] = {
@@ -333,11 +333,11 @@ object DSLParser extends PackratParsers {
   }
   
   lazy val simplePattern : PackratParser[Pattern] = {
-    log(arrayIndexPattern)("arrayIndexPattern") | stringPattern | fieldPattern
+    arrayIndexPattern | stringPattern | fieldPattern
   }
   
   lazy val complexPattern : PackratParser[Pattern] = {
-    log(continuousPatterns) ("continuousPatterns") | log(simplePattern)("simplePattern")
+    continuousPatterns | simplePattern
     
   }
   
@@ -379,6 +379,23 @@ sealed class ProjectionDSL () {
     }
   }
   
+  def jsObjectsUnion (jsObject1 : JsObject, jsObject2 : JsObject) : Map[String, JsValue]= {
+    val JsObject (ret1Map) = jsObject1
+    val JsObject (ret2Map) = jsObject2
+    
+    var retMap : Map[String, JsValue] = ret1Map
+    
+    for ((k,v) <- ret2Map) {
+      if (v.isInstanceOf[JsObject] && (retMap contains k)) {
+        retMap =  retMap + (k -> JsObject (jsObjectsUnion (v.asInstanceOf[JsObject], ret1Map(k).asInstanceOf[JsObject])))
+      } else {
+        retMap = retMap + (k -> v)
+      }
+    }
+    
+    retMap
+  }
+  
   def interpretExpression (expr : Expression, jsObject: JsValue) : JsValue = {
     expr match {
       case NumberConstant (num) => JsNumber (num)
@@ -414,7 +431,7 @@ sealed class ProjectionDSL () {
             
             val JsObject (ret1Map) = ret1JsObject
             val JsObject (ret2Map) = ret2JsObject
-            JsObject(ret1Map ++ ret2Map)
+            JsObject(jsObjectsUnion (ret1JsObject, ret2JsObject))
           }
         }        
       }

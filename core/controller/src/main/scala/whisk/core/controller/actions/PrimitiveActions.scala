@@ -270,17 +270,21 @@ protected[actions] trait PrimitiveActions {
         newMap += ("input" -> map("output"))
         newMap += ("saved" -> map("saved"))
       }
-      else if (! (map contains "output")) {
+      else if (! (map contains "output") && (map contains "input")) {
         //Input to first action of projection
-        newMap += ("input" -> payload.getOrElse(JsObject.empty))
-        newMap += ("saved" -> JsObject.empty)
+        newMap = map
+      } else {
+        throw new IllegalArgumentException (s"Incorrect given payload $payload")
       }
       
       var updatedPayload = JsObject(newMap)
       val ProjectionExecMetaData(code) = action.exec
-      System.out.println (s"invokeProjection:179 code is $code")
-      System.out.println (s"invokeProjection:179 updatedPayload is $updatedPayload")
+      System.out.println (s"invokeProjection:281 code is $code")
+      System.out.println (s"invokeProjection:282 updatedPayload is $updatedPayload")
       val dslResult = (new ProjectionDSL).apply(code, updatedPayload)
+      //newMap = newMap + ("input" -> dslResult)
+      //updatedPayload = dslResult
+      System.out.println (s"invokeProjection:284 dslResult: $dslResult for code $code and payload ${updatedPayload}")
       val end = Instant.now(Clock.systemUTC())
   
       // create the whisk activation
