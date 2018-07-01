@@ -305,7 +305,7 @@ protected[actions] trait SequenceActions {
     user: Identity,
     seqAction: WhiskActionMetaData,
     seqActivationId: ActivationId,
-    inputPayload: Option[JsObject],
+    payload: Option[JsObject],
     components: Vector[FullyQualifiedEntityName],
     cause: Option[ActivationId],
     atomicActionCnt: Int)(implicit transid: TransactionId): Future[SequenceAccounting] = {
@@ -324,6 +324,18 @@ protected[actions] trait SequenceActions {
     
     var nameToActions : Map[String, Future[WhiskActionMetaData]] = Map ()
     
+    val JsObject(map) = payload.getOrElse(JsObject.empty)
+    var newMap = Map [String, JsValue] ()
+    //if (map contains "input" && map contains "saved") {
+      //Should Not happen
+    //  logging.info (s"projection $action 's input contains input field")
+    //}
+    
+    //Input to first action of projection
+    newMap += ("saved" -> JsObject (("input"-> payload.getOrElse(JsObject.empty))))
+    newMap += ("output" -> JsObject.empty)
+    val inputPayload : Option[JsObject] = Option(JsObject(newMap.toMap))
+      
     for (iter <- 0 to components.size - 1) {
       var actionName : String = components(iter).toString
       val lastIndex = actionName.lastIndexOf ('/')
@@ -334,6 +346,7 @@ protected[actions] trait SequenceActions {
       Await.ready (resolvedFutureActions(iter), Duration.Inf)
       System.out.println (s"actionName: $actionName action " + resolvedFutureActions (iter))
     }
+    
     
     Await.ready (resolvedFutureActions(0), Duration.Inf)
     val firstAction =  resolvedFutureActions(0)
@@ -350,13 +363,14 @@ protected[actions] trait SequenceActions {
     System.out.println (s"Starting program $seqAction.")
     System.out.println (s"Size of resolved actions " + resolvedFutureActions.size)
     System.out.println (s"resolved: $resolved")
+    
     do {
         if (accounting.atomicActionCnt < actionSequenceLimit) {
           var nextActionName = ""
           var nextAction : Future[WhiskActionMetaData] = null
           if (iter == 0) {
             nextAction = firstAction
-          } else {
+          } else if (iter < components.size) {
             val payload = accounting.previousResponse.get().result.map(_.asJsObject)
             System.out.println (s"payload received $payload")
             var JsObject (payloadMap) = payload getOrElse (JsObject.empty)
@@ -372,6 +386,8 @@ protected[actions] trait SequenceActions {
               throw new Exception ("Next action " +nextActionName + " not in Program's Basic Blocks", None.orNull)
             
             nextAction = nameToActions(nextActionName)
+          } else {
+            iter = -1
           }
           
           if (iter != -1) {
@@ -385,7 +401,7 @@ protected[actions] trait SequenceActions {
                   Future.successful(_accounting)
                 } else {
                   // this is to short circuit the fold
-                  System.out.println ("Error calling action at $iter")
+                  System.out.println (s"Error calling action at $iter")
                   iter = -1
                   Future.failed(FailedSequenceActivation(_accounting)) // terminates the fold
                 }
@@ -395,7 +411,8 @@ protected[actions] trait SequenceActions {
           System.out.println (s"result at $iter is $result")
           Await.ready (result, Duration.Inf)
           System.out.println (s"result at $iter is $result")
-          iter += 1
+          if (iter != -1)
+            iter += 1
         } else {
           iter = -1
           val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
