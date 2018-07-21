@@ -371,21 +371,28 @@ protected[actions] trait SequenceActions {
           if (iter == 0) {
             nextAction = firstAction
           } else if (iter < components.size) {
-            val payload = accounting.previousResponse.get().result.map(_.asJsObject)
+            var payload = accounting.previousResponse.get().result.map(_.asJsObject)
             System.out.println (s"payload received $payload")
             var JsObject (payloadMap) = payload getOrElse (JsObject.empty)
             if (payloadMap contains "action") {
               val JsString (_next) = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
               nextActionName = _next
+              payloadMap = payloadMap - "action"
+              payload = Option(JsObject (payloadMap))
               System.out.println (s"nextActionName is $nextActionName")
             } else {
               iter = -1
             }
             
-            if (!(nameToActions contains nextActionName))
-              throw new Exception ("Next action " +nextActionName + " not in Program's Basic Blocks", None.orNull)
-            
-            nextAction = nameToActions(nextActionName)
+            if (nextActionName == "") {
+              //Last basicblock will not set action name
+              iter = -1
+            } else {
+              if (!(nameToActions contains nextActionName))
+                throw new Exception ("Next action " +nextActionName + " not in Program's Basic Blocks", None.orNull)
+              
+              nextAction = nameToActions(nextActionName)
+            }
           } else {
             iter = -1
           }

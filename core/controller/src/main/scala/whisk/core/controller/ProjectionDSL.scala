@@ -1,5 +1,7 @@
 //Grammar
-//e ::= c | [e1, e2, ..., en] | {str1: e1, ..., strn:en} | .complexPat | . | (e) | e1 * e2 | e1 == e2 | e1 != e2 | if e1 then e2 else e3
+//e ::= c | [e1, e2, ..., en] | {str1: e1, ..., strn:en} | .complexPat | . | (e1 ^ complexPat) | 
+//      (e) | e1 * e2 | e1 == e2 | e1 != e2 | e1 >= e2 | e1 <= e2 | e1 < e2 | e1 > e2 | 
+//      e1 && e2 | e1 || e2 | if e1 then e2 else e3
 //complexPat ::= simplePat | simplePat . complexPat
 //simplePat ::= [n] | id | [str]
 
@@ -13,6 +15,7 @@ import spray.json._
 sealed trait Token extends Positional
 class ConstantToken extends Token
 class ConditionalOperatorToken extends Token
+class LogicalOperatorToken extends Token
 case class NumberToken (num :String) extends ConstantToken
 case class BooleanToken (bool: String) extends ConstantToken
 case class StringToken (str : String) extends ConstantToken
@@ -25,6 +28,7 @@ case object CurlyBraceEnd extends Token // }
 case object BracketStart extends Token // (
 case object BracketEnd extends Token // )
 case object UnionOperatorToken extends Token //*
+case object PatternExistOperatorToken extends Token //^
 case object PatternDot extends Token //.
 case object KeyValueSeparator extends Token //:
 case object CommaSeparator extends Token
@@ -33,6 +37,12 @@ case object Then extends Token
 case object Else extends Token
 case object IsEqualToken extends ConditionalOperatorToken
 case object IsNotEqualToken extends ConditionalOperatorToken
+case object IsGreaterThanToken extends ConditionalOperatorToken
+case object IsGreaterEqualToken extends ConditionalOperatorToken
+case object IsLessThanToken extends ConditionalOperatorToken
+case object IsLessEqualToken extends ConditionalOperatorToken
+case object LogicalAndToken extends LogicalOperatorToken
+case object LogicalOrToken extends LogicalOperatorToken
 
 case class IdentifierToken (id: String) extends Token
 
@@ -48,6 +58,7 @@ object Tokenizer extends RegexParsers {
   def bracketStart = "(" ^^ {_ => BracketStart}
   def bracketEnd = ")" ^^ {_ => BracketEnd}
   def unionOperator = "*" ^^ {_ => UnionOperatorToken}
+  def patternExistOperator = "^" ^^ {_ => PatternExistOperatorToken}
   def patternDot = "." ^^ {_ => PatternDot}
   def keyValueSeparator = ":" ^^ {_ => KeyValueSeparator}
   def commaSeparator = "," ^^ {_ => CommaSeparator}
@@ -56,6 +67,12 @@ object Tokenizer extends RegexParsers {
   def thenKeyword = "then" ^^ {_ => Then}
   def isEqualToken = "==" ^^ {_ => IsEqualToken}
   def isNotEqualToken = "!=" ^^ {_ => IsNotEqualToken}
+  def isGreaterThanToken = ">" ^^ {_ => IsGreaterThanToken}
+  def isGreaterEqualToken = ">=" ^^ {_ => IsGreaterEqualToken}
+  def isLessThanToken = "<" ^^ {_ => IsLessThanToken}
+  def isLessEqualToken = "<=" ^^ {_ => IsLessEqualToken}
+  def logicalAndToken = "&&" ^^ {_ => LogicalAndToken}
+  def logicalOrToken = "||" ^^ {_ => LogicalOrToken}
   
   def identifier: Parser[IdentifierToken] = {
     //TODO: null is recognized as identifier
@@ -70,7 +87,7 @@ object Tokenizer extends RegexParsers {
   }
   
   def numberToken : Parser[NumberToken] = {
-    """\d+""".r ^^ { num => 
+    """[-+]?\d*\.\d+|\d+""".r ^^ { num => 
       NumberToken (num)
     }
   }
@@ -84,17 +101,20 @@ object Tokenizer extends RegexParsers {
   def nullToken = "null" ^^ (_ => NullToken)
   
   def tokens:Parser[List[Token]] = {
-    phrase (rep1 (bigBraceStart   | bigBraceEnd       | 
-                  curlyBraceStart | curlyBraceEnd     |
-                  bracketStart    | bracketEnd        |
-                  unionOperator   |
-                  patternDot      | keyValueSeparator |
-                  stringToken     | numberToken       | 
-                  booleanToken    | nullToken         |
-                  commaSeparator  | ifKeyword         | 
-                  elseKeyword     | thenKeyword       | 
-                  isEqualToken    | isNotEqualToken   | 
-                  booleanToken    | nullToken         |
+    phrase (rep1 (bigBraceStart   | bigBraceEnd          |
+                  curlyBraceStart | curlyBraceEnd        |
+                  bracketStart    | bracketEnd           |
+                  unionOperator   | patternExistOperator |
+                  patternDot      | keyValueSeparator    |
+                  stringToken     | numberToken          | 
+                  booleanToken    | nullToken            |
+                  commaSeparator  | ifKeyword            | 
+                  elseKeyword     | thenKeyword          | 
+                  isEqualToken    | isNotEqualToken      |
+                  isGreaterThanToken | isGreaterEqualToken |
+                  isLessThanToken | isLessEqualToken       |
+                  logicalAndToken | logicalOrToken         |
+                  booleanToken    | nullToken              |
                   identifier))
   }
   
@@ -115,7 +135,7 @@ case class TokenPosition (val col:Int) extends Position {
 
 class TokenReader (tokens: List[Token]) extends Reader[Token] {
   override def first: Token = tokens.head
-  override def atEnd: Boolean = tokens.isEmpty
+  override def atEnd: Boolean = {if (tokens.isEmpty == true) true else false}
   override def pos: Position = new TokenPosition(3-tokens.length)
   override def rest: Reader[Token] = new TokenReader(tokens.tail)
   override def drop (n: Int) = new TokenReader(tokens.drop(n))
@@ -123,7 +143,8 @@ class TokenReader (tokens: List[Token]) extends Reader[Token] {
 
 object Operator extends Enumeration {
   type Operator = Value
-  val IsEqual, IsNotEqual, Union = Value
+  val IsEqual, IsNotEqual, IsGreaterEqual, IsGreaterThan, IsLessThan, IsLessEqual,
+  Union, LogicalAnd, LogicalOr, PatternExist = Value
 }
 
 trait ASTNode
@@ -135,7 +156,7 @@ class Operator (op: Operator.Value) extends ASTNode {
 }
 class BinaryOperator (op: Operator.Value) extends Operator (op)
 
-case class NumberConstant (num : Int) extends Constant
+case class NumberConstant (num : Float) extends Constant
 case class BoolConstant (bool : Boolean) extends Constant
 case class StringConstant (str : String) extends Constant
 case class NullConstant () extends Constant
@@ -170,7 +191,15 @@ case class ThenASTNode() extends ASTNode
 case class ElseASTNode() extends ASTNode
 case class IsEqualOperator() extends BinaryOperator (Operator.IsEqual)
 case class IsNotEqualOperator() extends BinaryOperator (Operator.IsNotEqual)
+case class IsGreaterEqualOperator() extends BinaryOperator (Operator.IsGreaterEqual)
+case class IsGreaterThanOperator() extends BinaryOperator (Operator.IsGreaterThan)
+case class IsLessThanOperator () extends BinaryOperator (Operator.IsLessThan)
+case class IsLessEqualOperator () extends BinaryOperator (Operator.IsLessEqual)
+case class LogicalOrOperator () extends BinaryOperator (Operator.LogicalOr)
+case class LogicalAndOperator () extends BinaryOperator (Operator.LogicalAnd)
 case class UnionOperator () extends BinaryOperator (Operator.Union)
+case class PatternExistOperator () extends ASTNode 
+case class PatternExistExpression (exp: Expression, pat: Pattern) extends Expression
 
 case class DSLParsingError(msg: String, private val cause: Throwable = None.orNull) extends Exception ("Parsing Failed: " + msg, cause)
 
@@ -186,7 +215,7 @@ object DSLParser extends PackratParsers {
   }
   
   lazy val numberConstant : PackratParser[NumberConstant] = {
-    accept ("number", {case n @ NumberToken (num) => NumberConstant (num.toInt)})
+    accept ("number", {case n @ NumberToken (num) => NumberConstant (num.toFloat)})
   }
   
   lazy val boolConstant : PackratParser[BoolConstant] = {
@@ -250,15 +279,51 @@ object DSLParser extends PackratParsers {
   }
   
   lazy val isNotEqualOperator : PackratParser[IsNotEqualOperator] = {
-    accept ("!=", {case IsNotEqualToken => IsNotEqualOperator()})
+    accept ("==", {case IsNotEqualToken => IsNotEqualOperator()})
+  }
+  
+  lazy val isGreaterEqualOperator : PackratParser[IsGreaterEqualOperator] = {
+    accept (">=", {case IsGreaterEqualToken => IsGreaterEqualOperator()})
+  }
+  
+  lazy val isGreaterThanOperator : PackratParser[IsGreaterThanOperator] = {
+    accept (">", {case IsGreaterThanToken => IsGreaterThanOperator()})
+  }
+  
+  lazy val isLessThanOperator : PackratParser[IsLessThanOperator] = {
+    accept ("<=", {case IsLessThanToken => IsLessThanOperator()})
+  }
+  
+  lazy val isLessEqualOperator : PackratParser[IsLessEqualOperator] = {
+    accept ("<", {case IsLessEqualToken => IsLessEqualOperator()})
+  }
+
+  lazy val logicalOrOperator : PackratParser[LogicalOrOperator] = {
+    accept ("||", {case LogicalOrToken => LogicalOrOperator()})
+  }
+  
+  lazy val logicalAndOperator : PackratParser[LogicalAndOperator] = {
+    accept ("&&", {case LogicalAndToken => LogicalAndOperator()})
   }
   
   lazy val binaryOperator : PackratParser[BinaryOperator] = {
-    isEqualOperator | isNotEqualOperator | unionOperator
+    isEqualOperator | isNotEqualOperator | unionOperator | 
+    isGreaterEqualOperator | isGreaterThanOperator | isLessThanOperator | 
+    isLessEqualOperator | logicalOrOperator | logicalAndOperator
   }
 
+  lazy val patternExistOperator : PackratParser[PatternExistOperator] = {
+    accept ("^", {case PatternExistOperatorToken => PatternExistOperator ()})
+  }
+  
   lazy val unionOperator : PackratParser[UnionOperator] = {
     accept ("*", {case UnionOperatorToken => UnionOperator ()})
+  }
+  
+  lazy val patternExistExpression : PackratParser[PatternExistExpression] = {
+    (expression ~ patternExistOperator ~ complexPattern) ^^ {
+      case exp ~ _ ~ pat => PatternExistExpression(exp, pat)
+    }
   }
   
   lazy val bracketExpression : PackratParser[Expression] = {
@@ -324,12 +389,12 @@ object DSLParser extends PackratParsers {
   }
   
   lazy val expression : PackratParser[Expression] = {
-    bracketExpression        | ifThenElseExpression     | 
+    patternExistExpression   | bracketExpression        | ifThenElseExpression     | 
     binaryOperatorExpression | patternExpression        |
     stringConstant           | boolConstant             | 
     nullConstant             | numberConstant           | 
     arrayExpression          | jsonObjectExpression     | 
-    emptyPatternExpression
+    emptyPatternExpression 
   }
   
   lazy val simplePattern : PackratParser[Pattern] = {
@@ -355,7 +420,10 @@ object DSLParser extends PackratParsers {
 }
 
 class DSLInterpreterException (private val msg: String, private val cause: Throwable = None.orNull) extends Exception (msg, cause)
-
+class DSLInterpreterFieldNotFoundException (private val msg: String) extends DSLInterpreterException (msg)
+class DSLInterpreterKeyNotFoundException (private val msg: String) extends DSLInterpreterException (msg)
+class DSLInterpreterIndexOutOfBoundsException (private val msg: String) extends DSLInterpreterException (msg)
+          
 sealed class ProjectionDSL () {
   def apply (code : String, jsValue : JsValue) : JsValue = {
     val lexerResult = Tokenizer (code)
@@ -376,6 +444,22 @@ sealed class ProjectionDSL () {
       case exp : Expression => interpretExpression (exp, jsValue)
       //case pat : Pattern => interpretPattern (pat, jsObject)
       case _ => throw new IllegalArgumentException ("Not handling this ASTNode in interpreter $astNode")
+    }
+  }
+  
+  def jsValueToNumber (jsValue : JsValue) : BigDecimal = {
+    try {
+      return jsValue.asInstanceOf[JsNumber].value
+    } catch {
+      case e: Exception => throw new IllegalArgumentException (s"Cannot convert $jsValue to Number")
+    }
+  }
+  
+  def jsValueToBoolean (jsValue : JsValue) : Boolean = {
+    try {
+      return jsValue.asInstanceOf[JsBoolean].value
+    } catch {
+      case e: Exception => throw new IllegalArgumentException (s"Cannot convert $jsValue to Boolean")
     }
   }
   
@@ -407,13 +491,25 @@ sealed class ProjectionDSL () {
         val map : Map [String, JsValue] = keyVals.map {case KeyValuePair (key, expr) => (key, interpretExpression (expr, jsObject))}.toMap
         JsObject (map)
       }
+      case PatternExistExpression (e, pat) => {
+        val jsVal = interpretExpression (e, jsObject)
+        try {
+          val res = interpretPattern (pat, jsVal)
+          JsTrue
+        } catch {
+          case e : DSLInterpreterFieldNotFoundException => JsFalse
+          case e : DSLInterpreterKeyNotFoundException => JsFalse
+          case e : DSLInterpreterIndexOutOfBoundsException => JsFalse
+          case _ : Throwable => JsFalse 
+        }
+      }
       case BinaryOperatorExpression (e1, op, e2) => {
         val ret1 = interpretExpression (e1, jsObject)
         val ret2 = interpretExpression (e2, jsObject)
         op.getOperator match {
           case Operator.IsEqual => if (ret1 == ret2) JsTrue else JsFalse 
           case Operator.IsNotEqual => if (ret1 != ret2) JsTrue else JsFalse
-          case Operator.Union => { 
+          case Operator.Union => {
             var ret1JsObject : JsObject = null
             var ret2JsObject : JsObject = null
             
@@ -433,7 +529,49 @@ sealed class ProjectionDSL () {
             val JsObject (ret2Map) = ret2JsObject
             JsObject(jsObjectsUnion (ret1JsObject, ret2JsObject))
           }
-        }        
+          
+          case Operator.IsGreaterThan => {
+            val op1 = jsValueToNumber (ret1)
+            val op2 = jsValueToNumber (ret2)
+            
+            JsBoolean (op1 > op2)
+          }
+          
+          case Operator.IsGreaterEqual => {
+            val op1 = jsValueToNumber (ret1)
+            val op2 = jsValueToNumber (ret2)
+            
+            JsBoolean (op1 >= op2)
+          }
+          
+          case Operator.IsLessThan => {
+            val op1 = jsValueToNumber (ret1)
+            val op2 = jsValueToNumber (ret2)
+            
+            JsBoolean (op1 <= op2)
+          }
+          
+          case Operator.IsLessEqual => {
+            val op1 = jsValueToNumber (ret1)
+            val op2 = jsValueToNumber (ret2)
+            
+            JsBoolean (op1 < op2)
+          }
+          
+          case Operator.LogicalAnd => {
+            val op1 = jsValueToBoolean (ret1)
+            val op2 = jsValueToBoolean (ret2)
+            
+            JsBoolean (op1 && op2)
+          }
+          
+          case Operator.LogicalOr => {
+            val op1 = jsValueToBoolean (ret1)
+            val op2 = jsValueToBoolean (ret2)
+            
+            JsBoolean (op1 || op2)
+          }
+        }
       }
       case IfThenElseExpression(condExp, exp1, exp2) => {
         if (interpretExpression (condExp, jsObject) == JsTrue) {
@@ -475,6 +613,7 @@ sealed class ProjectionDSL () {
         }
         catch {
           case ex : java.lang.ClassCastException => throw new DSLInterpreterException (s"$jsValue is not Array. Error interpreting ArrayIndexPattern($index)")
+          case ex : java.lang.ArrayIndexOutOfBoundsException => throw new DSLInterpreterIndexOutOfBoundsException (s"$index out of array of length")
         }
       }
       
@@ -484,7 +623,7 @@ sealed class ProjectionDSL () {
           mapJsObject (field)
         }
         catch {
-          case e: Exception => throw new DSLInterpreterException (s"Field $field not present in JsObject $mapJsObject")
+          case e: Exception => throw new DSLInterpreterKeyNotFoundException (s"Field $field not present in JsObject $mapJsObject")
         }
       }
       
@@ -494,7 +633,7 @@ sealed class ProjectionDSL () {
           mapJsObject (str)
         }
         catch {
-          case e: Exception => throw new DSLInterpreterException (s"StringPattern $str not present in JsObject $mapJsObject")
+          case e: Exception => throw new DSLInterpreterFieldNotFoundException (s"StringPattern $str not present in JsObject $mapJsObject")
         }
       }
       case ContinuousPatterns (pattern1, pattern2) => interpretPattern (pattern2, interpretPattern (pattern1, jsValue))

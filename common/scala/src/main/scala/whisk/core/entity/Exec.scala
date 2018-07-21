@@ -378,7 +378,6 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
             case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
             case None => "."
           }
-          System.out.println (s"schemaCode:322 = $schemaCode")
           ProjectionExec(schemaCode)
         
         case Exec.FORK =>
@@ -563,7 +562,7 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
             case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
             case None => "."
           }
-          System.out.println(s"schemaCode:481 = $schemaCode")
+        
           ProjectionExecMetaData(schemaCode)
         
         case ExecMetaDataBase.FORK =>
