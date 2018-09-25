@@ -310,27 +310,13 @@ protected[actions] trait SequenceActions {
     cause: Option[ActivationId],
     atomicActionCnt: Int)(implicit transid: TransactionId): Future[SequenceAccounting] = {
 
-    // For each action in the sequence, fetch any of its associated parameters (including package or binding).
-    // We do this for all of the actions in the sequence even though it may be short circuited. This is to
-    // hide the latency of the fetches from the datastore and the parameter merging that has to occur. It
-    // may be desirable in the future to selectively speculate over a smaller number of components rather than
-    // the entire sequence.
-    //
-    // This action/parameter resolution is done in futures; the execution starts as soon as the first component
-    // is resolved.
     val resolvedFutureActions = resolveDefaultNamespace(components, user) map { c =>
       WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, c)
     }
-    
+
     var nameToActions : Map[String, Future[WhiskActionMetaData]] = Map ()
-    
-    val JsObject(map) = payload.getOrElse(JsObject.empty)
+
     var newMap = Map [String, JsValue] ()
-    //if (map contains "input" && map contains "saved") {
-      //Should Not happen
-    //  logging.info (s"projection $action 's input contains input field")
-    //}
-    
     //Input to first action of projection
     newMap += ("saved" -> JsObject (("input"-> payload.getOrElse(JsObject.empty))))
     newMap += ("output" -> JsObject.empty)
@@ -343,123 +329,42 @@ protected[actions] trait SequenceActions {
         actionName = actionName.substring (lastIndex + 1)
       }
       nameToActions = nameToActions + (actionName -> resolvedFutureActions(iter))
-      Await.ready (resolvedFutureActions(iter), Duration.Inf)
-      System.out.println (s"actionName: $actionName action " + resolvedFutureActions (iter))
     }
-    
-    
-    Await.ready (resolvedFutureActions(0), Duration.Inf)
-    val firstAction =  resolvedFutureActions(0)
+
     // this holds the initial value of the accounting structure, including the input boxed as an ActivationResponse
-    var accounting = SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
-    val initialAccounting = Future.successful {
-      accounting
+    val accounting = SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
+    def iterateProgramAction(accounting: SequenceAccounting): Future[SequenceAccounting] = {
+      if (accounting.shortcircuit) {
+        Future.failed(FailedSequenceActivation(accounting))
+      } else if (accounting.atomicActionCnt < actionSequenceLimit) {
+        var payload = accounting.previousResponse.get().result.map(_.asJsObject)
+        var JsObject(payloadMap) = payload getOrElse (JsObject.empty)
+        if (payloadMap contains "action") {
+          val JsString(next) = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
+          payloadMap = payloadMap - "action"
+          payload = Option(JsObject(payloadMap))
+
+          if (!(nameToActions contains next))
+            throw new Exception ("Next action " +next + " not in Program's Basic Blocks", None.orNull)
+
+          val nextAction = nameToActions(next)
+          invokeNextAction(user, nextAction, accounting, cause).flatMap(iterateProgramAction(_))
+        } else {
+          Future.successful(accounting)
+        }
+      } else {
+        val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
+        Future.failed(FailedSequenceActivation(updatedAccount))
+      }
     }
 
     // execute the actions in sequential blocking
-    var resolved = resolvedFutureActions map { e => e}
-    var result : Future[SequenceAccounting] = null
-    var iter : Int = 0
-    System.out.println (s"Starting program $seqAction.")
-    System.out.println (s"Size of resolved actions " + resolvedFutureActions.size)
-    System.out.println (s"resolved: $resolved")
-    
-    do {
-        if (accounting.atomicActionCnt < actionSequenceLimit) {
-          var nextActionName = ""
-          var nextAction : Future[WhiskActionMetaData] = null
-          if (iter == 0) {
-            nextAction = firstAction
-          } else if (iter < components.size) {
-            var payload = accounting.previousResponse.get().result.map(_.asJsObject)
-            System.out.println (s"payload received $payload")
-            var JsObject (payloadMap) = payload getOrElse (JsObject.empty)
-            if (payloadMap contains "action") {
-              val JsString (_next) = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
-              nextActionName = _next
-              payloadMap = payloadMap - "action"
-              payload = Option(JsObject (payloadMap))
-              System.out.println (s"nextActionName is $nextActionName")
-            } else {
-              iter = -1
-            }
-            
-            if (nextActionName == "") {
-              //Last basicblock will not set action name
-              iter = -1
-            } else {
-              if (!(nameToActions contains nextActionName))
-                throw new Exception ("Next action " +nextActionName + " not in Program's Basic Blocks", None.orNull)
-              
-              nextAction = nameToActions(nextActionName)
-            }
-          } else {
-            iter = -1
-          }
-          
-          if (iter != -1) {
-            Await.ready (nextAction, Duration.Inf)
-            System.out.println (s"iter $iter nextAction $nextAction")
-            result = invokeNextAction (user, nextAction, accounting, cause).flatMap { _accounting => {
-                accounting = _accounting
-                System.out.println (s"action called at $iter")
-                if (!_accounting.shortcircuit) {
-                  System.out.println (s"Called action successfully at $iter : $accounting")
-                  Future.successful(_accounting)
-                } else {
-                  // this is to short circuit the fold
-                  System.out.println (s"Error calling action at $iter")
-                  iter = -1
-                  Future.failed(FailedSequenceActivation(_accounting)) // terminates the fold
-                }
-              }
-            }
-          }
-          System.out.println (s"result at $iter is $result")
-          Await.ready (result, Duration.Inf)
-          System.out.println (s"result at $iter is $result")
-          if (iter != -1)
-            iter += 1
-        } else {
-          iter = -1
-          val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
-          result = Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
-        }      
-    } while (iter != -1)
-    
-    System.out.println (s"Final result $result")
-    Await.ready (result, Duration.Inf)
-    System.out.println (s"Final result after awaiting $result")
-    //result
-    result.recoverWith{
-      case FailedSequenceActivation(_acc) => Future.successful(_acc)
+    invokeNextAction(user, resolvedFutureActions(0), accounting, cause)
+      .flatMap(iterateProgramAction(_))
+      .recoverWith {
+        case FailedSequenceActivation(accounting) => Future.successful(accounting)
+      }
     }
-    
-    //~ resolvedFutureActions
-      //~ .foldLeft(initialAccounting) { (accountingFuture, futureAction) =>
-        //~ accountingFuture.flatMap { accounting =>
-          //~ if (accounting.atomicActionCnt < actionSequenceLimit) {
-            //~ invokeNextAction(user, futureAction, accounting, cause).flatMap { accounting =>
-              //~ if (!accounting.shortcircuit) {
-                //~ Future.successful(accounting)
-              //~ } else {
-                //~ // this is to short circuit the fold
-                //~ Future.failed(FailedSequenceActivation(accounting)) // terminates the fold
-              //~ }
-            //~ }
-          //~ } else {
-            //~ val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
-            //~ Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
-          //~ }
-        //~ }
-      //~ }
-      //~ .recoverWith {
-        //~ // turn the failed accounting back to success; this is the only possible failure
-        //~ // since all throwables are recovered with a failed accounting instance and this is
-        //~ // in turned boxed to FailedSequenceActivation
-        //~ case FailedSequenceActivation(accounting) => Future.successful(accounting)
-      //~ }
-  }
   
   /**
    * Invokes the components of a sequence in a blocking fashion.
