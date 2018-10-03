@@ -344,11 +344,13 @@ protected[actions] trait SequenceActions {
           payloadMap = payloadMap - "action"
           payload = Option(JsObject(payloadMap))
 
-          if (!(nameToActions contains next))
-            throw new Exception ("Next action " +next + " not in Program's Basic Blocks", None.orNull)
-
-          val nextAction = nameToActions(next)
-          invokeNextAction(user, nextAction, accounting, cause).flatMap(iterateProgramAction(_))
+          if (!(nameToActions contains next)) {
+            val updatedAccount = accounting.fail(ActivationResponse.applicationError(compositionComponentNotFound(next)), None)
+            Future.failed(FailedSequenceActivation(updatedAccount))
+          } else {
+            val nextAction = nameToActions(next)
+            invokeNextAction(user, nextAction, accounting, cause).flatMap(iterateProgramAction(_))
+          }
         } else {
           Future.successful(accounting)
         }
