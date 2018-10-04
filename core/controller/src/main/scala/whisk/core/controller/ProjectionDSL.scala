@@ -560,7 +560,7 @@ sealed class ProjectionDSL () {
           
           case Operator.LogicalAnd => {
             val op1 = jsValueToBoolean (ret1)
-            if (op1 == JsFalse) {
+            if (op1 == false) {
               JsFalse
             } else {
               val op2 = jsValueToBoolean (ret2)
@@ -571,7 +571,7 @@ sealed class ProjectionDSL () {
           
           case Operator.LogicalOr => {
             val op1 = jsValueToBoolean (ret1)
-            if (op1 == JsTrue) {
+            if (op1 == true) {
               JsTrue
             } else {
               val op2 = jsValueToBoolean (ret2)

@@ -1,3 +1,6 @@
+# Openwhisk HTTP invoke actions, shell script using curl and bash
+```curl -v -s -k https://172.17.0.1/api/v1/namespaces/whisk.system/actions/utils/echo?blocking=true\&result=true -X POST -H "Authorization: BaszFmNi00ZWQ1LThjNTQtODE2YWE0ZjhjNTAyOjEyM3pPM3haQ0xyTU42djJCS0sxZFhZRnBYbFBrY2NPRnFtMTJDZEFzTWdSVTRWck5aOWx5R1ZDR3VNREdJd1A=" -H "Content-Type: application/json" -d '{"text":"hello"}'```
+
 # Instructions for Deploying OpenWhisk on Docker container
 ```
 #Deployment has been tested on Ubuntu 14.04
