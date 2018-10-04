@@ -37,6 +37,8 @@ import whisk.core.controller.WhiskActionsApi
 import whisk.core.entity._
 import whisk.http.Messages._
 
+import scala.util.Success
+
 /**
  * Tests Conductor Actions API.
  *
@@ -84,9 +86,9 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       response.fields("response").asJsObject.fields("result") shouldBe JsObject("payload" -> testString.toJson)
       response.fields("duration") shouldBe duration.toJson
       val annotations = response.fields("annotations").convertTo[Parameters]
-      annotations.getAs[Boolean]("conductor") shouldBe Some(true)
-      annotations.getAs[String]("kind") shouldBe Some("sequence")
-      annotations.getAs[Boolean]("topmost") shouldBe Some(true)
+      annotations.getAs[Boolean]("conductor") shouldBe Success(true)
+      annotations.getAs[String]("kind") shouldBe Success("sequence")
+      annotations.getAs[Boolean]("topmost") shouldBe Success(true)
       annotations.get("limits") should not be None
       response.fields("logs").convertTo[JsArray].elements.size shouldBe 1
     }
@@ -117,7 +119,7 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
       response.fields("response").asJsObject.fields("result") shouldBe JsObject(
         "error" -> compositionComponentInvalid(invalid.toJson).toJson)
-      response.fields("logs").convertTo[JsArray].elements.size shouldBe 1
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 2
     }
 
     // an undefined action
@@ -127,8 +129,8 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       val response = responseAs[JsObject]
       response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
       response.fields("response").asJsObject.fields("result") shouldBe JsObject(
-        "error" -> compositionComponentNotFound(missing.toString).toJson)
-      response.fields("logs").convertTo[JsArray].elements.size shouldBe 1
+        "error" -> compositionComponentNotFound(s"$namespace/$missing").toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 2
     }
   }
 
@@ -137,7 +139,7 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
     put(entityStore, WhiskAction(namespace, conductor, jsDefault("??"), annotations = Parameters("conductor", "true")))
     put(entityStore, WhiskAction(namespace, step, jsDefault("??")))
     put(entityStore, WhiskAction(alternateNamespace, step, jsDefault("??"))) // forbidden action
-    val forbidden = s"$alternateNamespace/$step" // forbidden action name
+    val forbidden = s"/$alternateNamespace/$step" // forbidden action name
 
     // dynamically invoke step action
     Post(
@@ -179,8 +181,8 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
       val response = responseAs[JsObject]
       response.fields("response").asJsObject.fields("status") shouldBe "application error".toJson
       response.fields("response").asJsObject.fields("result") shouldBe JsObject(
-        "error" -> compositionComponentNotAccessible(forbidden).toJson)
-      response.fields("logs").convertTo[JsArray].elements.size shouldBe 1
+        "error" -> compositionComponentNotAccessible(forbidden.drop(1)).toJson)
+      response.fields("logs").convertTo[JsArray].elements.size shouldBe 2
     }
 
     // dynamically invoke step action twice, forwarding state
@@ -348,11 +350,11 @@ class ConductorsApiTests extends ControllerTestCommon with WhiskActionsApi {
                 else {
                   val action = args.fields.get("action") map { action =>
                     Map("action" -> action)
-                  } getOrElse Map()
+                  } getOrElse Map.empty
                   val state = args.fields.get("state") map { state =>
                     Map("state" -> state)
-                  } getOrElse Map()
-                  val wrappedParams = args.fields.getOrElse("params", JsObject()).asJsObject.fields
+                  } getOrElse Map.empty
+                  val wrappedParams = args.fields.getOrElse("params", JsObject.empty).asJsObject.fields
                   val escapedParams = args.fields - "action" - "state" - "params"
                   val params = Map("params" -> JsObject(wrappedParams ++ escapedParams))
                   JsObject(params ++ action ++ state)

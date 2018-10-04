@@ -46,14 +46,14 @@ class RemoveLogsTests extends FlatSpec with DatabaseScriptTestUtils with StreamL
     WhiskProperties.getFileRelativeToWhiskHome("tools/db/deleteLogsFromActivations.py").getAbsolutePath
 
   /** Runs the clean up script to delete old activations */
-  def removeLogsTool(dbUrl: String, dbName: String, days: Int, docsPerRequest: Int = 20) = {
-    println(s"Running removeLogs tool: $dbUrl, $dbName, $days, $docsPerRequest")
+  def removeLogsTool(dbUrl: DatabaseUrl, dbName: String, days: Int, docsPerRequest: Int = 20) = {
+    println(s"Running removeLogs tool: ${dbUrl.safeUrl}, $dbName, $days, $docsPerRequest")
 
     val cmd = Seq(
       python,
       removeLogsToolPath,
       "--dbUrl",
-      dbUrl,
+      dbUrl.url,
       "--dbName",
       dbName,
       "--days",
@@ -75,7 +75,7 @@ class RemoveLogsTests extends FlatSpec with DatabaseScriptTestUtils with StreamL
         namespace = EntityPath("testns1"),
         name = EntityName("testname1"),
         subject = Subject("test-sub1"),
-        activationId = ActivationId(),
+        activationId = ActivationId.generate(),
         start = Instant.now.minus(2, ChronoUnit.DAYS),
         end = Instant.now,
         logs = ActivationLogs(Vector("first line1", "second line1")))
@@ -84,7 +84,7 @@ class RemoveLogsTests extends FlatSpec with DatabaseScriptTestUtils with StreamL
         namespace = EntityPath("testns2"),
         name = EntityName("testname2"),
         subject = Subject("test-sub2"),
-        activationId = ActivationId(),
+        activationId = ActivationId.generate(),
         start = Instant.now,
         end = Instant.now,
         logs = ActivationLogs(Vector("first line2", "second line2")))

@@ -19,41 +19,29 @@ package system.basic
 
 import scala.concurrent.duration.DurationInt
 import scala.language.postfixOps
-
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-
-import common.ActivationResult
-import common.StreamLogging
-import common.JsHelpers
-import common.TestHelpers
-import common.TestUtils
-import common.BaseWsk
-import common.WskProps
-import common.WskTestHelpers
-
+import common._
+import common.rest.WskRestOperations
 import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.JsObject
-import spray.json.pimpAny
-
 import whisk.core.entity.size.SizeInt
 import whisk.core.WhiskConfig
 import whisk.http.Messages._
 
 @RunWith(classOf[JUnitRunner])
-abstract class WskConductorTests extends TestHelpers with WskTestHelpers with JsHelpers with StreamLogging {
+class WskConductorTests extends TestHelpers with WskTestHelpers with JsHelpers with StreamLogging with WskActorSystem {
 
   implicit val wskprops = WskProps()
-  val wsk: BaseWsk
+  val wsk: WskOperations = new WskRestOperations
+
   val allowedActionDuration = 120 seconds
 
   val testString = "this is a test"
   val invalid = "invalid#Action"
   val missing = "missingAction"
 
-  val whiskConfig = new WhiskConfig(Map(WhiskConfig.actionSequenceMaxLimit -> null))
-  assert(whiskConfig.isValid)
+  val whiskConfig = new WhiskConfig(Map(WhiskConfig.actionSequenceMaxLimit -> "50"))
   val limit = whiskConfig.actionSequenceLimit.toInt
 
   behavior of "Whisk conductor actions"
@@ -116,16 +104,18 @@ abstract class WskConductorTests extends TestHelpers with WskTestHelpers with Js
         activation.response.status shouldBe "application error"
         activation.response.result.get.fields.get("error") shouldBe Some(
           JsString(compositionComponentInvalid(JsString(invalid))))
-        checkConductorLogsAndAnnotations(activation, 1) // echo
+        checkConductorLogsAndAnnotations(activation, 2) // echo
       }
 
       // an undefined action
       val undefinedrun = wsk.action.invoke(echo, Map("payload" -> testString.toJson, "action" -> missing.toJson))
+      val namespace = wsk.namespace.whois()
+
       withActivation(wsk.activation, undefinedrun) { activation =>
         activation.response.status shouldBe "application error"
         activation.response.result.get.fields.get("error") shouldBe Some(
-          JsString(compositionComponentNotFound(missing)))
-        checkConductorLogsAndAnnotations(activation, 1) // echo
+          JsString(compositionComponentNotFound(s"$namespace/$missing")))
+        checkConductorLogsAndAnnotations(activation, 2) // echo
       }
   }
 

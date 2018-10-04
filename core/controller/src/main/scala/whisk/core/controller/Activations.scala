@@ -26,18 +26,17 @@ import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport.sprayJsonMarsha
 import akka.http.scaladsl.model.StatusCodes.BadRequest
 import akka.http.scaladsl.server.Directives
 import akka.http.scaladsl.unmarshalling._
-import spray.json._
 import spray.json.DefaultJsonProtocol.RootJsObjectFormat
 import whisk.common.TransactionId
 import whisk.core.containerpool.logging.LogStore
-import whisk.core.controller.RestApiCommons.ListLimit
-import whisk.core.database.StaleParameter
+import whisk.core.controller.RestApiCommons.{ListLimit, ListSkip}
+import whisk.core.database.ActivationStore
 import whisk.core.entitlement.Privilege.READ
 import whisk.core.entitlement.{Collection, Privilege, Resource}
 import whisk.core.entity._
-import whisk.core.entity.types.ActivationStore
 import whisk.http.ErrorResponse.terminate
 import whisk.http.Messages
+import whisk.core.database.UserContext
 
 object WhiskActivationsApi {
 
@@ -63,6 +62,10 @@ object WhiskActivationsApi {
   /** Custom unmarshaller for query parameters "limit" for "list" operations. */
   private implicit val stringToListLimit: Unmarshaller[String, ListLimit] =
     RestApiCommons.stringToListLimit(Collection(Collection.ACTIVATIONS))
+
+  /** Custom unmarshaller for query parameters "skip" for "list" operations. */
+  private implicit val stringToListSkip: Unmarshaller[String, ListSkip] =
+    RestApiCommons.stringToListSkip(Collection(Collection.ACTIVATIONS))
 
 }
 
@@ -92,10 +95,10 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
 
   /** Validated entity name as an ActivationId from the matched path segment. */
   protected override def entityname(n: String) = {
-    val activationId = Try { ActivationId(n) }
+    val activationId = ActivationId.parse(n)
     validate(activationId.isSuccess, activationId match {
-      case Failure(DeserializationException(t, _, _)) => t
-      case _                                          => Messages.activationIdIllegal
+      case Failure(t: IllegalArgumentException) => t.getMessage
+      case _                                    => Messages.activationIdIllegal
     }) & extract(_ => n)
   }
 
@@ -117,17 +120,21 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
   /** Dispatches resource to the proper handler depending on context. */
   protected override def dispatchOp(user: Identity, op: Privilege, resource: Resource)(
     implicit transid: TransactionId) = {
-    resource.entity match {
-      case Some(ActivationId(id)) =>
-        op match {
-          case READ => fetch(resource.namespace, id)
-          case _    => reject // should not get here
-        }
-      case None =>
-        op match {
-          case READ => list(resource.namespace)
-          case _    => reject // should not get here
-        }
+    extractRequest { request =>
+      val context = UserContext(user, request)
+
+      resource.entity.flatMap(e => ActivationId.parse(e).toOption) match {
+        case Some(aid) =>
+          op match {
+            case READ => fetch(context, resource.namespace, aid)
+            case _    => reject // should not get here
+          }
+        case None =>
+          op match {
+            case READ => list(context, resource.namespace)
+            case _    => reject // should not get here
+          }
+      }
     }
   }
 
@@ -138,13 +145,14 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
    * - 200 [] or [WhiskActivation as JSON]
    * - 500 Internal Server Error
    */
-  private def list(namespace: EntityPath)(implicit transid: TransactionId) = {
+  private def list(context: UserContext, namespace: EntityPath)(implicit transid: TransactionId) = {
     import WhiskActivationsApi.stringToRestrictedEntityPath
     import WhiskActivationsApi.stringToInstantDeserializer
     import WhiskActivationsApi.stringToListLimit
+    import WhiskActivationsApi.stringToListSkip
 
     parameter(
-      'skip ? 0,
+      'skip.as[ListSkip] ? ListSkip(collection.defaultListSkip),
       'limit.as[ListLimit] ? ListLimit(collection.defaultListLimit),
       'count ? false,
       'docs ? false,
@@ -153,40 +161,16 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
       'upto.as[Instant] ?) { (skip, limit, count, docs, name, since, upto) =>
       if (count && !docs) {
         countEntities {
-          WhiskActivation.countCollectionInNamespace(
-            activationStore,
-            name.flatten.map(p => namespace.addPath(p)).getOrElse(namespace),
-            skip,
-            since,
-            upto,
-            StaleParameter.UpdateAfter,
-            viewName = name.flatten.map(_ => WhiskActivation.filtersView).getOrElse(WhiskActivation.view))
+          activationStore.countActivationsInNamespace(namespace, name.flatten, skip.n, since, upto, context)
         }
       } else if (count && docs) {
         terminate(BadRequest, Messages.docsNotAllowedWithCount)
       } else {
         val activations = name.flatten match {
           case Some(action) =>
-            WhiskActivation.listActivationsMatchingName(
-              activationStore,
-              namespace,
-              action,
-              skip,
-              limit.n,
-              docs,
-              since,
-              upto,
-              StaleParameter.UpdateAfter)
+            activationStore.listActivationsMatchingName(namespace, action, skip.n, limit.n, docs, since, upto, context)
           case None =>
-            WhiskActivation.listCollectionInNamespace(
-              activationStore,
-              namespace,
-              skip,
-              limit.n,
-              docs,
-              since,
-              upto,
-              StaleParameter.UpdateAfter)
+            activationStore.listActivationsInNamespace(namespace, skip.n, limit.n, docs, since, upto, context)
         }
         listEntities(activations map (_.fold((js) => js, (wa) => wa.map(_.toExtendedJson))))
       }
@@ -201,17 +185,15 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
    * - 404 Not Found
    * - 500 Internal Server Error
    */
-  private def fetch(namespace: EntityPath, activationId: ActivationId)(implicit transid: TransactionId) = {
+  private def fetch(context: UserContext, namespace: EntityPath, activationId: ActivationId)(
+    implicit transid: TransactionId) = {
     val docid = DocId(WhiskEntity.qualifiedName(namespace, activationId))
     pathEndOrSingleSlash {
       getEntity(
-        WhiskActivation,
-        activationStore,
-        docid,
+        activationStore.get(ActivationId(docid.asString), context),
         postProcess = Some((activation: WhiskActivation) => complete(activation.toExtendedJson)))
-
-    } ~ (pathPrefix(resultPath) & pathEnd) { fetchResponse(docid) } ~
-      (pathPrefix(logsPath) & pathEnd) { fetchLogs(docid) }
+    } ~ (pathPrefix(resultPath) & pathEnd) { fetchResponse(context, docid) } ~
+      (pathPrefix(logsPath) & pathEnd) { fetchLogs(context, docid) }
   }
 
   /**
@@ -222,11 +204,9 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
    * - 404 Not Found
    * - 500 Internal Server Error
    */
-  private def fetchResponse(docid: DocId)(implicit transid: TransactionId) = {
+  private def fetchResponse(context: UserContext, docid: DocId)(implicit transid: TransactionId) = {
     getEntityAndProject(
-      WhiskActivation,
-      activationStore,
-      docid,
+      activationStore.get(ActivationId(docid.asString), context),
       (activation: WhiskActivation) => Future.successful(activation.response.toExtendedJson))
   }
 
@@ -238,11 +218,9 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
    * - 404 Not Found
    * - 500 Internal Server Error
    */
-  private def fetchLogs(docid: DocId)(implicit transid: TransactionId) = {
+  private def fetchLogs(context: UserContext, docid: DocId)(implicit transid: TransactionId) = {
     getEntityAndProject(
-      WhiskActivation,
-      activationStore,
-      docid,
-      (activation: WhiskActivation) => logStore.fetchLogs(activation).map(_.toJsonObject))
+      activationStore.get(ActivationId(docid.asString), context),
+      (activation: WhiskActivation) => logStore.fetchLogs(activation, context).map(_.toJsonObject))
   }
 }

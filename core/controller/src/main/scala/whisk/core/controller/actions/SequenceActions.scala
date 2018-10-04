@@ -17,30 +17,27 @@
 
 package whisk.core.controller.actions
 
-import java.time.Clock
-import java.time.Instant
+import java.time.{Clock, Instant}
 import java.util.concurrent.atomic.AtomicReference
 
-import scala.collection._
-import scala.concurrent.ExecutionContext
-import scala.concurrent.Future
-import scala.concurrent.duration._
-import scala.language.postfixOps
-import scala.util.Failure
-import scala.util.Success
-
 import akka.actor.ActorSystem
-
 import spray.json._
-
-import whisk.common.Logging
-import whisk.common.TransactionId
+import whisk.common.{Logging, TransactionId, UserEvents}
+import whisk.core.connector.{EventMessage, MessagingProvider}
 import whisk.core.controller.WhiskServices
+import whisk.core.database.{ActivationStore, NoDocumentException, UserContext}
 import whisk.core.entity._
 import whisk.core.entity.size.SizeInt
 import whisk.core.entity.types._
 import whisk.http.Messages._
+import whisk.spi.SpiLoader
 import whisk.utils.ExecutionContextFactory.FutureExtensions
+
+import scala.collection._
+import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
+import scala.language.postfixOps
+import scala.util.{Failure, Success}
 
 protected[actions] trait SequenceActions {
   /** The core collections require backend services to be injected in this trait. */
@@ -60,6 +57,13 @@ protected[actions] trait SequenceActions {
   /** Database service to get activations. */
   protected val activationStore: ActivationStore
 
+  /** Instace of the controller. This is needed to write user-metrics. */
+  protected val activeAckTopicIndex: ControllerInstanceId
+
+  /** Message producer. This is needed to write user-metrics. */
+  private val messagingProvider = SpiLoader.get[MessagingProvider]
+  private val producer = messagingProvider.getProducer(services.whiskConfig)
+
   /** A method that knows how to invoke a single primitive action. */
   protected[actions] def invokeAction(
     user: Identity,
@@ -73,11 +77,11 @@ protected[actions] trait SequenceActions {
    *
    * @param user the user invoking the action
    * @param action the sequence action to be invoked
-   * @param payload the dynamic arguments for the activation
-   * @param blocking true iff this is a blocking invoke
-   * @param topmost true iff this is the topmost sequence invoked directly through the api (not indirectly through a sequence)
    * @param components the actions in the sequence
+   * @param payload the dynamic arguments for the activation
+   * @param waitForOutermostResponse some duration iff this is a blocking invoke
    * @param cause the id of the activation that caused this sequence (defined only for inner sequences and None for topmost sequences)
+   * @param topmost true iff this is the topmost sequence invoked directly through the api (not indirectly through a sequence)
    * @param atomicActionsCount the dynamic atomic action count observed so far since the start of invocation of the topmost sequence(0 if topmost)
    * @param transid a transaction id for logging
    * @return a future of type (ActivationId, Some(WhiskActivation), atomicActionsCount) if blocking; else (ActivationId, None, 0)
@@ -140,6 +144,64 @@ protected[actions] trait SequenceActions {
     }
   }
 
+  protected[actions] def invokeProgram(
+    user: Identity,
+    action: WhiskActionMetaData,
+    components: Vector[FullyQualifiedEntityName],
+    payload: Option[JsObject],
+    waitForOutermostResponse: Option[FiniteDuration],
+    cause: Option[ActivationId],
+    topmost: Boolean,
+    atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)] = {
+    require(action.exec.kind == Exec.PROGRAM, "this method requires an action program")
+
+    // create new activation id that corresponds to the sequence
+    val seqActivationId = activationIdFactory.make()
+    logging.info(this, s"invoking sequence $action topmost $topmost activationid '$seqActivationId'")
+
+    val start = Instant.now(Clock.systemUTC())
+    val futureSeqResult: Future[(Either[ActivationId, WhiskActivation], Int)] = {
+      // even though the result of completeSequenceActivation is Right[WhiskActivation],
+      // use a more general type for futureSeqResult in case a blocking invoke takes
+      // longer than expected and we must return Left[ActivationId] instead
+      completeSequenceActivation(
+        seqActivationId,
+        // the cause for the component activations is the current sequence
+        invokeProgramComponents(
+          user,
+          action,
+          seqActivationId,
+          payload,
+          components,
+          cause = Some(seqActivationId),
+          atomicActionsCount),
+        user,
+        action,
+        topmost,
+        start,
+        cause)
+    }
+
+    if (topmost) { // need to deal with blocking and closing connection
+      waitForOutermostResponse
+        .map { timeout =>
+          logging.debug(this, s"invoke sequence blocking topmost!")
+          futureSeqResult.withAlternativeAfterTimeout(
+            timeout,
+            Future.successful(Left(seqActivationId), atomicActionsCount))
+        }
+        .getOrElse {
+          // non-blocking sequence execution, return activation id
+          Future.successful(Left(seqActivationId), 0)
+        }
+    } else {
+      // not topmost, no need to worry about terminating incoming request
+      // and this is a blocking activation therefore by definition
+      // Note: the future for the sequence result recovers from all throwable failures
+      futureSeqResult
+    }
+  }
+  
   /**
    * Creates an activation for the sequence and writes it back to the datastore.
    */
@@ -151,6 +213,8 @@ protected[actions] trait SequenceActions {
                                          start: Instant,
                                          cause: Option[ActivationId])(
     implicit transid: TransactionId): Future[(Right[ActivationId, WhiskActivation], Int)] = {
+    val context = UserContext(user)
+
     // not topmost, no need to worry about terminating incoming request
     // Note: the future for the sequence result recovers from all throwable failures
     futureSeqResult
@@ -162,26 +226,19 @@ protected[actions] trait SequenceActions {
         (Right(seqActivation), accounting.atomicActionCnt)
       }
       .andThen {
-        case Success((Right(seqActivation), _)) => storeSequenceActivation(seqActivation)
+        case Success((Right(seqActivation), _)) =>
+          if (UserEvents.enabled) {
+            EventMessage.from(seqActivation, s"controller${activeAckTopicIndex.asString}", user.namespace.uuid) match {
+              case Success(msg) => UserEvents.send(producer, msg)
+              case Failure(t)   => logging.warn(this, s"activation event was not sent: $t")
+            }
+          }
+          activationStore.store(seqActivation, context)(transid, notifier = None)
 
         // This should never happen; in this case, there is no activation record created or stored:
         // should there be?
-        case Failure(t) => logging.error(this, s"Sequence activation failed: ${t.getMessage}")
+        case Failure(t) => logging.error(this, s"sequence activation failed: ${t.getMessage}")
       }
-  }
-
-  /**
-   * Stores sequence activation to database.
-   */
-  private def storeSequenceActivation(activation: WhiskActivation)(implicit transid: TransactionId): Unit = {
-    logging.debug(this, s"recording activation '${activation.activationId}'")
-    WhiskActivation.put(activationStore, activation)(transid, notifier = None) onComplete {
-      case Success(id) => logging.debug(this, s"recorded activation")
-      case Failure(t) =>
-        logging.error(
-          this,
-          s"failed to record activation ${activation.activationId} with error ${t.getLocalizedMessage}")
-    }
   }
 
   /**
@@ -210,7 +267,7 @@ protected[actions] trait SequenceActions {
 
     // create the whisk activation
     WhiskActivation(
-      namespace = user.namespace.toPath,
+      namespace = user.namespace.name.toPath,
       name = action.name,
       user.subject,
       activationId = activationId,
@@ -228,7 +285,89 @@ protected[actions] trait SequenceActions {
         sequenceLimits,
       duration = Some(accounting.duration))
   }
+  
+  /**
+   * Invokes the components of a sequence in a blocking fashion.
+   * Returns a vector of successful futures containing the results of the invocation of all components in the sequence.
+   * Unexpected behavior is modeled through an Either with activation(right) or activation response in case of error (left).
+   *
+   * Keeps track of the dynamic atomic action count.
+   * @param user the user invoking the sequence
+   * @param seqAction the sequence invoked
+   * @param seqActivationId the id of the sequence
+   * @param inputPayload the payload passed to the first component in the sequence
+   * @param components the components in the sequence
+   * @param cause the activation id of the sequence that lead to invoking this sequence or None if this sequence is topmost
+   * @param atomicActionCnt the dynamic atomic action count observed so far since the start of the execution of the topmost sequence
+   * @return a future which resolves with the accounting for a sequence, including the last result, duration, and activation ids
+   */
+  private def invokeProgramComponents(
+    user: Identity,
+    seqAction: WhiskActionMetaData,
+    seqActivationId: ActivationId,
+    payload: Option[JsObject],
+    components: Vector[FullyQualifiedEntityName],
+    cause: Option[ActivationId],
+    atomicActionCnt: Int)(implicit transid: TransactionId): Future[SequenceAccounting] = {
 
+    val resolvedFutureActions = resolveDefaultNamespace(components, user) map { c =>
+      WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, c)
+    }
+
+    var nameToActions : Map[String, Future[WhiskActionMetaData]] = Map ()
+
+    var newMap = Map [String, JsValue] ()
+    //Input to first action of projection
+    newMap += ("saved" -> JsObject (("input"-> payload.getOrElse(JsObject.empty))))
+    newMap += ("output" -> JsObject.empty)
+    val inputPayload : Option[JsObject] = Option(JsObject(newMap.toMap))
+      
+    for (iter <- 0 to components.size - 1) {
+      var actionName : String = components(iter).toString
+      val lastIndex = actionName.lastIndexOf ('/')
+      if (lastIndex != -1) {
+        actionName = actionName.substring (lastIndex + 1)
+      }
+      nameToActions = nameToActions + (actionName -> resolvedFutureActions(iter))
+    }
+
+    // this holds the initial value of the accounting structure, including the input boxed as an ActivationResponse
+    val accounting = SequenceAccounting(atomicActionCnt, ActivationResponse.payloadPlaceholder(inputPayload))
+    def iterateProgramAction(accounting: SequenceAccounting): Future[SequenceAccounting] = {
+      if (accounting.shortcircuit) {
+        Future.failed(FailedSequenceActivation(accounting))
+      } else if (accounting.atomicActionCnt < actionSequenceLimit) {
+        var payload = accounting.previousResponse.get().result.map(_.asJsObject)
+        var JsObject(payloadMap) = payload getOrElse (JsObject.empty)
+        if (payloadMap contains "action") {
+          val JsString(next) = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
+          payloadMap = payloadMap - "action"
+          payload = Option(JsObject(payloadMap))
+
+          if (!(nameToActions contains next)) {
+            val updatedAccount = accounting.fail(ActivationResponse.applicationError(compositionComponentNotFound(next)), None)
+            Future.failed(FailedSequenceActivation(updatedAccount))
+          } else {
+            val nextAction = nameToActions(next)
+            invokeNextAction(user, nextAction, accounting, cause).flatMap(iterateProgramAction(_))
+          }
+        } else {
+          Future.successful(accounting)
+        }
+      } else {
+        val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
+        Future.failed(FailedSequenceActivation(updatedAccount))
+      }
+    }
+
+    // execute the actions in sequential blocking
+    invokeNextAction(user, resolvedFutureActions(0), accounting, cause)
+      .flatMap(iterateProgramAction(_))
+      .recoverWith {
+        case FailedSequenceActivation(accounting) => Future.successful(accounting)
+      }
+    }
+  
   /**
    * Invokes the components of a sequence in a blocking fashion.
    * Returns a vector of successful futures containing the results of the invocation of all components in the sequence.
@@ -275,14 +414,21 @@ protected[actions] trait SequenceActions {
       .foldLeft(initialAccounting) { (accountingFuture, futureAction) =>
         accountingFuture.flatMap { accounting =>
           if (accounting.atomicActionCnt < actionSequenceLimit) {
-            invokeNextAction(user, futureAction, accounting, cause).flatMap { accounting =>
-              if (!accounting.shortcircuit) {
-                Future.successful(accounting)
-              } else {
-                // this is to short circuit the fold
-                Future.failed(FailedSequenceActivation(accounting)) // terminates the fold
+            invokeNextAction(user, futureAction, accounting, cause)
+              .flatMap { accounting =>
+                if (!accounting.shortcircuit) {
+                  Future.successful(accounting)
+                } else {
+                  // this is to short circuit the fold
+                  Future.failed(FailedSequenceActivation(accounting)) // terminates the fold
+                }
               }
-            }
+              .recoverWith {
+                case _: NoDocumentException =>
+                  val updatedAccount =
+                    accounting.fail(ActivationResponse.applicationError(sequenceComponentNotFound), None)
+                  Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
+              }
           } else {
             val updatedAccount = accounting.fail(ActivationResponse.applicationError(sequenceIsTooLong), None)
             Future.failed(FailedSequenceActivation(updatedAccount)) // terminates the fold
@@ -324,9 +470,23 @@ protected[actions] trait SequenceActions {
 
       // invoke the action by calling the right method depending on whether it's an atomic action or a sequence
       val futureWhiskActivationTuple = action.toExecutableWhiskAction match {
+        case None if action.exec.isInstanceOf[ProjectionExecMetaData] =>
+          // this is an invoke for an atomic action
+          logging.info(this, s"sequence invoking a projection action $action")
+          val timeout = action.limits.timeout.duration + 1.minute
+          invokeAction(user, action, inputPayload, waitForResponse = Some(timeout), cause) map {
+            case res => (res, accounting.atomicActionCnt + 1)
+          }
+        case None if action.exec.isInstanceOf[ForkExecMetaData] =>
+          // this is an invoke for an atomic action
+          logging.info(this, s"sequence invoking a fork action $action")
+          val timeout = action.limits.timeout.duration + 1.minute
+          invokeAction(user, action, inputPayload, waitForResponse = Some(timeout), cause) map {
+            case res => (res, accounting.atomicActionCnt + 1)
+          }
         case None =>
           val SequenceExecMetaData(components) = action.exec
-          logging.info(this, s"sequence invoking an enclosed sequence $action")
+          logging.debug(this, s"sequence invoking an enclosed sequence $action")
           // call invokeSequence to invoke the inner sequence; this is a blocking activation by definition
           invokeSequence(
             user,
@@ -339,7 +499,7 @@ protected[actions] trait SequenceActions {
             accounting.atomicActionCnt)
         case Some(executable) =>
           // this is an invoke for an atomic action
-          logging.info(this, s"sequence invoking an enclosed atomic action $action")
+          logging.debug(this, s"sequence invoking an enclosed atomic action $action")
           val timeout = action.limits.timeout.duration + 1.minute
           invokeAction(user, action, inputPayload, waitForResponse = Some(timeout), cause) map {
             case res => (res, accounting.atomicActionCnt + 1)

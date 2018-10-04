@@ -1,3 +1,21 @@
+<!--
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+-->
 # OpenWhisk CLI
 
 OpenWhisk offers a powerful command line interface that allows complete management of all aspects of the system.
@@ -41,12 +59,15 @@ To verify your CLI setup, try [creating and running an action](./samples.md).
 ### Configure command completion for Openwhisk CLI
 
 For bash command completion to work, bash 4.1 or newer is required. The most recent Linux distributions should have the correct version of bash but Mac users will most likely have an older version.
+
 Mac users can check their bash version and update it by running the following commands:
 
 ```
 bash --version
-brew install bash-completion
+brew install bash
 ```
+
+This requires [Homebrew](https://brew.sh/) to be installed. The updated bash will be installed in `/usr/local/bin`.
 
 To write the bash command completion to your local directory, run the following command:
 

@@ -19,7 +19,6 @@ package whisk.core.entity
 
 import scala.concurrent.Future
 import scala.util.Try
-
 import spray.json._
 import types.AuthStore
 import whisk.common.Logging
@@ -32,19 +31,24 @@ import whisk.core.entitlement.Privilege
 
 case class UserLimits(invocationsPerMinute: Option[Int] = None,
                       concurrentInvocations: Option[Int] = None,
-                      firesPerMinute: Option[Int] = None)
+                      firesPerMinute: Option[Int] = None,
+                      allowedKinds: Option[Set[String]] = None)
 
 object UserLimits extends DefaultJsonProtocol {
-  implicit val serdes = jsonFormat3(UserLimits.apply)
+  implicit val serdes = jsonFormat4(UserLimits.apply)
+}
+
+protected[core] case class Namespace(name: EntityName, uuid: UUID)
+
+protected[core] object Namespace extends DefaultJsonProtocol {
+  implicit val serdes = jsonFormat2(Namespace.apply)
 }
 
 protected[core] case class Identity(subject: Subject,
-                                    namespace: EntityName,
-                                    authkey: AuthKey,
+                                    namespace: Namespace,
+                                    authkey: GenericAuthKey,
                                     rights: Set[Privilege],
-                                    limits: UserLimits = UserLimits()) {
-  def uuid = authkey.uuid
-}
+                                    limits: UserLimits = UserLimits())
 
 object Identity extends MultipleReadersSingleWriterCache[Identity, DocInfo] with DefaultJsonProtocol {
 
@@ -83,7 +87,8 @@ object Identity extends MultipleReadersSingleWriterCache[Identity, DocInfo] with
       })
   }
 
-  def get(datastore: AuthStore, authkey: AuthKey)(implicit transid: TransactionId): Future[Identity] = {
+  def get(datastore: AuthStore, authkey: BasicAuthenticationAuthKey)(
+    implicit transid: TransactionId): Future[Identity] = {
     implicit val logger: Logging = datastore.logging
     implicit val ec = datastore.executionContext
 
@@ -126,7 +131,12 @@ object Identity extends MultipleReadersSingleWriterCache[Identity, DocInfo] with
         val JsString(uuid) = value("uuid")
         val JsString(secret) = value("key")
         val JsString(namespace) = value("namespace")
-        Identity(subject, EntityName(namespace), AuthKey(UUID(uuid), Secret(secret)), Privilege.ALL, limits)
+        Identity(
+          subject,
+          Namespace(EntityName(namespace), UUID(uuid)),
+          BasicAuthenticationAuthKey(UUID(uuid), Secret(secret)),
+          Privilege.ALL,
+          limits)
       case _ =>
         logger.error(this, s"$viewName[$key] has malformed view '${row.compactPrint}'")
         throw new IllegalStateException("identities view malformed")

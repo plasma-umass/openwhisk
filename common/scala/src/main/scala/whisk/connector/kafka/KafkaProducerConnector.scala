@@ -17,47 +17,50 @@
 
 package whisk.connector.kafka
 
-import java.util.Properties
-
-import scala.concurrent.ExecutionContext
-import scala.concurrent.Future
-import scala.concurrent.Promise
-import scala.util.Failure
-import scala.util.Success
-import org.apache.kafka.clients.producer.Callback
-import org.apache.kafka.clients.producer.KafkaProducer
-import org.apache.kafka.clients.producer.ProducerConfig
-import org.apache.kafka.clients.producer.ProducerRecord
-import org.apache.kafka.clients.producer.RecordMetadata
-import org.apache.kafka.common.errors.NotLeaderForPartitionException
+import akka.actor.ActorSystem
+import akka.pattern.after
+import org.apache.kafka.clients.producer._
+import org.apache.kafka.common.errors._
 import org.apache.kafka.common.serialization.StringSerializer
-import whisk.common.Counter
-import whisk.common.Logging
-import whisk.core.connector.Message
-import whisk.core.connector.MessageProducer
-import whisk.core.entity.UUIDs
 import pureconfig._
+import whisk.common.{Counter, Logging, TransactionId}
+import whisk.connector.kafka.KafkaConfiguration._
 import whisk.core.ConfigKeys
+import whisk.core.connector.{Message, MessageProducer}
+import whisk.core.entity.UUIDs
+import whisk.utils.Exceptions
 
-class KafkaProducerConnector(kafkahosts: String,
-                             implicit val executionContext: ExecutionContext,
-                             id: String = UUIDs.randomUUID().toString)(implicit logging: Logging)
-    extends MessageProducer {
+import scala.collection.JavaConverters._
+import scala.concurrent.duration._
+import scala.concurrent.{blocking, ExecutionContext, Future, Promise}
+import scala.util.{Failure, Success}
 
-  override def sentCount() = sentCounter.cur
+class KafkaProducerConnector(kafkahosts: String, id: String = UUIDs.randomUUID().toString)(implicit logging: Logging,
+                                                                                           actorSystem: ActorSystem)
+    extends MessageProducer
+    with Exceptions {
+
+  implicit val ec: ExecutionContext = actorSystem.dispatcher
+  private val gracefulWaitTime = 100.milliseconds
+
+  override def sentCount(): Long = sentCounter.cur
 
   /** Sends msg to topic. This is an asynchronous operation. */
-  override def send(topic: String, msg: Message, retry: Int = 2): Future[RecordMetadata] = {
-    implicit val transid = msg.transid
+  override def send(topic: String, msg: Message, retry: Int = 3): Future[RecordMetadata] = {
+    implicit val transid: TransactionId = msg.transid
     val record = new ProducerRecord[String, String](topic, "messages", msg.serialize)
     val produced = Promise[RecordMetadata]()
 
-    producer.send(record, new Callback {
-      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
-        if (exception == null) produced.success(metadata)
-        else produced.failure(exception)
+    Future {
+      blocking {
+        producer.send(record, new Callback {
+          override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
+            if (exception == null) produced.success(metadata)
+            else produced.failure(exception)
+          }
+        })
       }
-    })
+    }
 
     produced.future.andThen {
       case Success(status) =>
@@ -66,39 +69,47 @@ class KafkaProducerConnector(kafkahosts: String,
       case Failure(t) =>
         logging.error(this, s"sending message on topic '$topic' failed: ${t.getMessage}")
     } recoverWith {
-      case t: NotLeaderForPartitionException =>
-        if (retry > 0) {
-          logging.error(this, s"NotLeaderForPartitionException is retryable, remain $retry retry")
-          Thread.sleep(100)
-          send(topic, msg, retry - 1)
-        } else produced.future
+      // Do not retry on these exceptions as they may cause duplicate messages on Kafka.
+      case _: NotEnoughReplicasAfterAppendException | _: TimeoutException =>
+        recreateProducer()
+        produced.future
+      case r: RetriableException if retry > 0 =>
+        logging.info(this, s"$r: Retrying $retry more times")
+        after(gracefulWaitTime, actorSystem.scheduler)(send(topic, msg, retry - 1))
+      // Ignore this exception as restarting the producer doesn't make sense
+      case e: RecordTooLargeException =>
+        Future.failed(e)
+      // All unknown errors just result in a recreation of the producer. The failure is propagated.
+      case _: Throwable =>
+        recreateProducer()
+        produced.future
     }
   }
 
   /** Closes producer. */
-  override def close() = {
+  override def close(): Unit = {
     logging.info(this, "closing producer")
     producer.close()
   }
 
   private val sentCounter = new Counter()
 
-  private def getProps: Properties = {
-    val props = new Properties
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkahosts)
+  private def createProducer(): KafkaProducer[String, String] = {
+    val config = Map(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG -> kafkahosts) ++
+      configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaCommon)) ++
+      configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaProducer))
 
-    // Load additional config from the config files and add them here.
-    val config =
-      KafkaConfiguration.configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaProducer))
-    config.foreach { case (key, value) => props.put(key, value) }
-    props
+    verifyConfig(config, ProducerConfig.configNames().asScala.toSet)
+
+    tryAndThrow("creating producer")(new KafkaProducer(config, new StringSerializer, new StringSerializer))
   }
 
-  private def getProducer(props: Properties): KafkaProducer[String, String] = {
-    val keySerializer = new StringSerializer
-    val valueSerializer = new StringSerializer
-    new KafkaProducer(props, keySerializer, valueSerializer)
+  private def recreateProducer(): Unit = {
+    logging.info(this, s"recreating producer")
+    tryAndSwallow("closing old producer")(producer.close())
+    logging.info(this, s"old producer closed")
+    producer = createProducer()
   }
 
-  private val producer = getProducer(getProps)
+  @volatile private var producer = createProducer()
 }

@@ -21,27 +21,32 @@ import java.time.{Clock, Instant}
 
 import scala.collection.immutable.Map
 import scala.concurrent.Future
-import scala.util.{Failure, Try}
+import scala.util.Try
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.model.HttpMethods.POST
-import akka.http.scaladsl.model.StatusCodes.{Accepted, BadRequest, InternalServerError, OK, ServerError}
+import akka.http.scaladsl.model.StatusCodes.{Accepted, BadRequest, InternalServerError, NoContent, OK, ServerError}
 import akka.http.scaladsl.model.Uri.Path
-import akka.http.scaladsl.model.headers.{Authorization, BasicHttpCredentials}
+import akka.http.scaladsl.model.headers.Authorization
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.server.{RequestContext, RouteResult}
 import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
 import akka.stream.ActorMaterializer
 import spray.json.DefaultJsonProtocol._
+import com.typesafe.sslconfig.akka.AkkaSSLConfig
+import pureconfig.loadConfigOrThrow
 import spray.json._
-import whisk.common.TransactionId
-import whisk.core.controller.RestApiCommons.ListLimit
-import whisk.core.database.CacheChangeNotification
+import whisk.common.Https.HttpsConfig
+import whisk.common.{Https, TransactionId}
+import whisk.core.controller.RestApiCommons.{ListLimit, ListSkip}
+import whisk.core.database.{ActivationStore, CacheChangeNotification}
 import whisk.core.entitlement.Collection
 import whisk.core.entity._
-import whisk.core.entity.types.{ActivationStore, EntityStore}
+import whisk.core.entity.types.EntityStore
 import whisk.http.ErrorResponse
+import whisk.http.Messages
+import whisk.core.database.UserContext
 
 /** A trait implementing the triggers API. */
 trait WhiskTriggersApi extends WhiskCollectionAPI {
@@ -55,6 +60,30 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
   /** Database service to CRUD triggers. */
   protected val entityStore: EntityStore
 
+  /** Connection context for HTTPS */
+  protected lazy val httpsConnectionContext = {
+    val sslConfig = AkkaSSLConfig().mapSettings { s =>
+      s.withLoose(s.loose.withDisableHostnameVerification(true))
+    }
+    val httpsConfig = loadConfigOrThrow[HttpsConfig]("whisk.controller.https")
+    Https.connectionContext(httpsConfig, Some(sslConfig))
+
+  }
+
+  protected val controllerProtocol = loadConfigOrThrow[String]("whisk.controller.protocol")
+
+  /**
+   * Sends a request either over http or https depending on the configuration
+   * @param request http request to send
+   * @return http response packed in a future
+   */
+  private def singleRequest(request: HttpRequest): Future[HttpResponse] = {
+    if (controllerProtocol == "https")
+      Http().singleRequest(request, connectionContext = httpsConnectionContext)
+    else
+      Http().singleRequest(request)
+  }
+
   /** Notification service for cache invalidation. */
   protected implicit val cacheChangeNotification: Some[CacheChangeNotification]
 
@@ -64,7 +93,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
   /** JSON response formatter. */
   /** Path to Triggers REST API. */
   protected val triggersPath = "triggers"
-  protected val url = Uri(s"http://localhost:${whiskConfig.servicePort}")
+  protected val url = Uri(s"${controllerProtocol}://localhost:${whiskConfig.servicePort}")
 
   protected implicit val materializer: ActorMaterializer
 
@@ -106,50 +135,54 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
    */
   override def activate(user: Identity, entityName: FullyQualifiedEntityName, env: Option[Parameters])(
     implicit transid: TransactionId) = {
-    entity(as[Option[JsObject]]) { payload =>
-      getEntity(WhiskTrigger, entityStore, entityName.toDocId, Some {
-        trigger: WhiskTrigger =>
-          val triggerActivationId = activationIdFactory.make()
-          logging.info(this, s"[POST] trigger activation id: ${triggerActivationId}")
-          val triggerActivation = WhiskActivation(
-            namespace = user.namespace.toPath, // all activations should end up in the one space regardless trigger.namespace,
-            entityName.name,
-            user.subject,
-            triggerActivationId,
-            Instant.now(Clock.systemUTC()),
-            Instant.EPOCH,
-            response = ActivationResponse.success(payload orElse Some(JsObject())),
-            version = trigger.version,
-            duration = None)
+    extractRequest { request =>
+      val context = UserContext(user, request)
 
-          // List of active rules associated with the trigger
-          val activeRules: Map[FullyQualifiedEntityName, ReducedRule] =
-            trigger.rules.map(_.filter(_._2.status == Status.ACTIVE)).getOrElse(Map.empty)
+      entity(as[Option[JsObject]]) { payload =>
+        getEntity(WhiskTrigger.get(entityStore, entityName.toDocId), Some {
+          trigger: WhiskTrigger =>
+            val triggerActivationId = activationIdFactory.make()
+            logging.info(this, s"[POST] trigger activation id: ${triggerActivationId}")
+            val triggerActivation = WhiskActivation(
+              namespace = user.namespace.name.toPath, // all activations should end up in the one space regardless trigger.namespace,
+              entityName.name,
+              user.subject,
+              triggerActivationId,
+              Instant.now(Clock.systemUTC()),
+              Instant.EPOCH,
+              response = ActivationResponse.success(payload orElse Some(JsObject.empty)),
+              version = trigger.version,
+              duration = None)
 
-          if (activeRules.nonEmpty) {
-            val args: JsObject = trigger.parameters.merge(payload).getOrElse(JsObject())
+            // List of active rules associated with the trigger
+            val activeRules: Map[FullyQualifiedEntityName, ReducedRule] =
+              trigger.rules.map(_.filter(_._2.status == Status.ACTIVE)).getOrElse(Map.empty)
 
-            activateRules(user, args, activeRules)
-              .map(results => triggerActivation.withLogs(ActivationLogs(results.map(_.toJson.compactPrint).toVector)))
-              .recover {
-                case e =>
-                  logging.error(this, s"Failed to write action activation results to trigger activation: $e")
-                  triggerActivation
+            if (activeRules.nonEmpty) {
+              val args: JsObject = trigger.parameters.merge(payload).getOrElse(JsObject.empty)
+
+              activateRules(user, args, trigger.rules.getOrElse(Map.empty))
+                .map(results => triggerActivation.withLogs(ActivationLogs(results.map(_.toJson.compactPrint).toVector)))
+                .recover {
+                  case e =>
+                    logging.error(this, s"Failed to write action activation results to trigger activation: $e")
+                    triggerActivation
+                }
+                .map { activation =>
+                  activationStore.store(activation, context)
+                }
+              respondWithActivationIdHeader(triggerActivationId) {
+                complete(Accepted, triggerActivationId.toJsObject)
               }
-              .map { activation =>
-                logging.debug(
+            } else {
+              logging
+                .debug(
                   this,
-                  s"[POST] trigger activated, writing activation record to datastore: $triggerActivationId")
-                WhiskActivation.put(activationStore, activation)
-              }
-              .andThen {
-                case Failure(t) =>
-                  logging.error(this, s"[POST] storing trigger activation $triggerActivationId failed: ${t.getMessage}")
-              }
-          }
-
-          complete(Accepted, triggerActivationId.toJsObject)
-      })
+                  s"[POST] trigger without an active rule was activated; no trigger activation record created for $entityName")
+              complete(NoContent)
+            }
+        })
+      }
     }
   }
 
@@ -183,7 +216,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
    */
   override def fetch(user: Identity, entityName: FullyQualifiedEntityName, env: Option[Parameters])(
     implicit transid: TransactionId) = {
-    getEntity(WhiskTrigger, entityStore, entityName.toDocId, Some { trigger =>
+    getEntity(WhiskTrigger.get(entityStore, entityName.toDocId), Some { trigger =>
       completeAsTriggerResponse(trigger)
     })
   }
@@ -196,20 +229,22 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
    * - 500 Internal Server Error
    */
   override def list(user: Identity, namespace: EntityPath)(implicit transid: TransactionId) = {
-    parameter('skip ? 0, 'limit.as[ListLimit] ? ListLimit(collection.defaultListLimit), 'count ? false) {
-      (skip, limit, count) =>
-        if (!count) {
-          listEntities {
-            WhiskTrigger.listCollectionInNamespace(entityStore, namespace, skip, limit.n, includeDocs = false) map {
-              list =>
-                list.fold((js) => js, (ts) => ts.map(WhiskTrigger.serdes.write(_)))
-            }
-          }
-        } else {
-          countEntities {
-            WhiskTrigger.countCollectionInNamespace(entityStore, namespace, skip)
+    parameter(
+      'skip.as[ListSkip] ? ListSkip(collection.defaultListSkip),
+      'limit.as[ListLimit] ? ListLimit(collection.defaultListLimit),
+      'count ? false) { (skip, limit, count) =>
+      if (!count) {
+        listEntities {
+          WhiskTrigger.listCollectionInNamespace(entityStore, namespace, skip.n, limit.n, includeDocs = false) map {
+            list =>
+              list.fold((js) => js, (ts) => ts.map(WhiskTrigger.serdes.write(_)))
           }
         }
+      } else {
+        countEntities {
+          WhiskTrigger.countCollectionInNamespace(entityStore, namespace, skip.n)
+        }
+      }
     }
   }
 
@@ -239,15 +274,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
       content.publish getOrElse trigger.publish,
       content.annotations getOrElse trigger.annotations,
       trigger.rules).revision[WhiskTrigger](trigger.docinfo.rev)
-
-    // feed must be specified in create, and cannot be added as a trigger update
-    content.annotations flatMap { _.get(Parameters.Feed) } map { _ =>
-      Future failed {
-        RejectRequest(BadRequest, "A trigger feed is only permitted when the trigger is created")
-      }
-    } getOrElse {
-      Future successful newTrigger
-    }
+    Future.successful(newTrigger)
   }
 
   /**
@@ -287,13 +314,21 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
   }
 
   /**
-   * Iterates through each active rule and invoke each mapped action.
+   * Iterates through each rule and invoking each active rule's mapped action.
    */
   private def activateRules(user: Identity,
                             args: JsObject,
                             rulesToActivate: Map[FullyQualifiedEntityName, ReducedRule])(
     implicit transid: TransactionId): Future[Iterable[RuleActivationResult]] = {
     val ruleResults = rulesToActivate.map {
+      case (ruleName, rule) if (rule.status != Status.ACTIVE) =>
+        Future.successful {
+          RuleActivationResult(
+            ActivationResponse.ApplicationError,
+            ruleName,
+            rule.action,
+            Left(Messages.triggerWithInactiveRule(ruleName.asString, rule.action.asString)))
+        }
       case (ruleName, rule) =>
         // Invoke the action. Retain action results for inclusion in the trigger activation record
         postActivation(user, rule, args)
@@ -346,13 +381,14 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
 
   /**
    * Posts an action activation. Currently done by posting internally to the controller.
-   * TODO: use a poper path that does not route through HTTP.
+   * TODO: use a proper path that does not route through HTTP.
    *
    * @param rule the name of the rule that is activated
    * @param args the arguments to post to the action
    * @return a future with the HTTP response from the action activation
    */
-  private def postActivation(user: Identity, rule: ReducedRule, args: JsObject): Future[HttpResponse] = {
+  private def postActivation(user: Identity, rule: ReducedRule, args: JsObject)(
+    implicit transid: TransactionId): Future[HttpResponse] = {
     // Build the url to invoke an action mapped to the rule
     val actionUrl = baseControllerPath / rule.action.path.root.asString / "actions"
 
@@ -360,13 +396,17 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
       .map(pkg => Path / pkg.namespace / rule.action.name.asString)
       .getOrElse(Path / rule.action.name.asString)
 
-    val request = HttpRequest(
-      method = POST,
-      uri = url.withPath(actionUrl ++ actionPath),
-      headers = List(Authorization(BasicHttpCredentials(user.authkey.uuid.asString, user.authkey.key.asString))),
-      entity = HttpEntity(MediaTypes.`application/json`, args.compactPrint))
+    user.authkey.getCredentials
+      .map { creds =>
+        val request = HttpRequest(
+          method = POST,
+          uri = url.withPath(actionUrl ++ actionPath),
+          headers = List(Authorization(creds), transid.toHeader),
+          entity = HttpEntity(MediaTypes.`application/json`, args.compactPrint))
 
-    Http().singleRequest(request)
+        singleRequest(request)
+      }
+      .getOrElse(Future.failed(new NoCredentialsAvailable()))
   }
 
   /** Contains the result of invoking a rule */
@@ -389,4 +429,10 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
 
   /** Custom unmarshaller for query parameters "limit" for "list" operations. */
   private implicit val stringToListLimit: Unmarshaller[String, ListLimit] = RestApiCommons.stringToListLimit(collection)
+
+  /** Custom unmarshaller for query parameters "skip" for "list" operations. */
+  private implicit val stringToListSkip: Unmarshaller[String, ListSkip] = RestApiCommons.stringToListSkip(collection)
+
+  private case class NoCredentialsAvailable() extends IllegalArgumentException
+
 }

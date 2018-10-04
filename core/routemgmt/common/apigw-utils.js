@@ -41,7 +41,7 @@ function generateTargetUrlMap(ibmConfig) {
         var execs = element['execute'];
         //each nth element of execs and operations go together, so lets add those to the map.
         for (var i = 0; i < operations.length ; ++i) {
-          if(i < execs.length && execs[i] && execs[i]['invoke']['target-url']) {
+          if(i < execs.length && execs[i] && execs[i]['invoke'] && execs[i]['invoke']['target-url']) {
             targetUrls[operations[i]] = execs[i]['invoke']['target-url'];
           }
         }
@@ -516,6 +516,7 @@ function generateBaseSwaggerApi(basepath, apiname) {
  *                    backendUrl:
  *                    name:
  *                    namespace:
+ *                    secureKey
  *                  }
  *                }
  *   responsetype Optional. The web action invocation .extension.  Defaults to json
@@ -528,8 +529,6 @@ function addEndpointToSwaggerApi(swaggerApi, endpoint, responsetype) {
   responsetype = responsetype || 'json';
   console.log('addEndpointToSwaggerApi: operationid = '+operationId);
   try {
-    var auth_base64 = Buffer.from(endpoint.action.authkey,'ascii').toString('base64');
-
     // If the relative path already exists, append to it; otherwise create it
     if (!swaggerApi.paths[endpoint.gatewayPath]) {
       swaggerApi.paths[endpoint.gatewayPath] = {};
@@ -569,6 +568,10 @@ function setActionOperationInvocationDetails(swagger, endpoint, operationId, res
   _.set(swagger, 'x-ibm-configuration.assembly.execute[0].operation-switch.case['+caseIdx+'].operations', operations);
   _.set(swagger, 'x-ibm-configuration.assembly.execute[0].operation-switch.case['+caseIdx+'].execute[0].invoke.target-url',  makeWebActionBackendUrl(endpoint.action, responsetype, getPathParameters(endpoint.gatewayPath)));
   _.set(swagger, 'x-ibm-configuration.assembly.execute[0].operation-switch.case['+caseIdx+'].execute[0].invoke.verb', 'keep');
+  if (endpoint.action.secureKey) {
+    _.set(swagger, 'x-ibm-configuration.assembly.execute[0].operation-switch.case['+caseIdx+'].execute[1].set-variable.actions[0].set', 'message.headers.X-Require-Whisk-Auth' );
+    _.set(swagger, 'x-ibm-configuration.assembly.execute[0].operation-switch.case['+caseIdx+'].execute[1].set-variable.actions[0].value', endpoint.action.secureKey );
+  }
 }
 
 // Return the numeric index into case[] into which the associated operation will be configured
@@ -885,7 +888,7 @@ function replaceNamespaceInUrl(url, namespace) {
  *     {
  *        statusCode: 502,    <- signifies an application error
  *        headers: {'Content-Type': 'application/json'},
- *        body: Base64 encoded JSON error string
+ *        body: JSON object or JSON string
  *     }
  * Otherwise, the action was invoked as a regular OpenWhisk action
  * (i.e. https://OW-HOST/api/v1/namesapces/NS/actions/ACTION) and the
@@ -904,18 +907,16 @@ function makeErrorResponseObject(err, isWebAction) {
     return err;
   }
 
-  var bodystr;
+  var bodystr = err;
   if (typeof err === 'string') {
-    bodystr = JSON.stringify({
+    bodystr = {
       "error": JSON.parse(makeJsonString(err)),  // Make sure err is plain old string to avoid duplicate JSON escaping
-    });
-  } else {
-    bodystr = JSON.stringify(err);
+    };
   }
   return {
     statusCode: 502,
     headers: { 'Content-Type': 'application/json' },
-    body: new Buffer(bodystr).toString('base64'),
+    body: bodystr
   };
 }
 
@@ -930,7 +931,7 @@ function makeErrorResponseObject(err, isWebAction) {
  *     {
  *        statusCode: 200,    <- signifies a successful action
  *        headers: {'Content-Type': 'application/json'},
- *        body: Base64 encoded JSON error string
+ *        body: JSON object or JSON string
  *     }
  * Otherwise, the action was invoked as a regular OpenWhisk action
  * (i.e. https://OW-HOST/api/v1/namesapces/NS/actions/ACTION) and the
@@ -945,20 +946,18 @@ function makeErrorResponseObject(err, isWebAction) {
 function makeResponseObject(resp, isWebAction) {
   console.log('makeResponseObject: isWebAction: '+isWebAction);
   if (!isWebAction) {
-    console.log('makeErrorResponseObject: not called as a web action');
+    console.log('makeResponseObject: not called as a web action');
     return resp;
   }
 
-  var bodystr;
+  var bodystr = resp;
   if (typeof resp === 'string') {
-    bodystr = makeJsonString(resp);
-  } else {
-    bodystr = JSON.stringify(resp);
+    bodystr = JSON.parse(makeJsonString(resp));
   }
   retobj = {
     statusCode: 200,
     headers: { 'Content-Type': 'application/json' },
-    body: new Buffer(bodystr).toString('base64')
+    body: bodystr
   };
   return retobj;
 }

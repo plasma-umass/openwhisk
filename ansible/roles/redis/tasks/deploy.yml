@@ -1,8 +1,12 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
 ---
 # This role will install redis
 
 - name: "pull the redis:{{ redis.version }} image"
   shell: "docker pull redis:{{ redis.version }}"
+  register: result
+  until: (result.rc == 0)
   retries: "{{ docker.pull.retries }}"
   delay: "{{ docker.pull.delay }}"
 
@@ -15,9 +19,11 @@
     restart_policy: "{{ docker.restart.policy }}"
     ports:
       - "{{ redis.port }}:6379"
+    env:
+      TZ: "{{ docker.timezone }}"
 
 - name: wait until redis is up and running
-  action: shell (echo PING; sleep 1) | nc {{ ansible_host }} {{ redis.port }}
+  action: shell (echo PING; sleep 1) | nc -w 1 {{ ansible_host }} {{ redis.port }}
   register: result
   until: (result.rc == 0) and (result.stdout == '+PONG')
   retries: 12

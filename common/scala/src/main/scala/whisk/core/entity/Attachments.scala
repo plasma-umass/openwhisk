@@ -17,14 +17,12 @@
 
 package whisk.core.entity
 
-import scala.util.Try
-
 import akka.http.scaladsl.model.ContentType
-
-import spray.json._
 import spray.json.DefaultJsonProtocol._
-
+import spray.json._
 import whisk.core.entity.size._
+
+import scala.util.Try
 
 object Attachments {
 
@@ -41,7 +39,11 @@ object Attachments {
 
   case class Inline[T](value: T) extends Attachment[T]
 
-  case class Attached(attachmentName: String, attachmentType: ContentType) extends Attachment[Nothing]
+  case class Attached(attachmentName: String,
+                      attachmentType: ContentType,
+                      length: Option[Long] = None,
+                      digest: Option[String] = None)
+      extends Attachment[Nothing]
 
   // Attachments are considered free because the name/content type are system determined
   // and a size check for the content is done during create/update
@@ -49,6 +51,13 @@ object Attachments {
     def sizeIn(unit: SizeUnits.Unit): ByteSize = a match {
       case Inline(v) => (v: SizeConversion).sizeIn(unit)
       case _         => 0.bytes
+    }
+  }
+
+  implicit class OptionSizeAttachment[T <% SizeConversion](a: Option[Attachment[T]]) extends SizeConversion {
+    def sizeIn(unit: SizeUnits.Unit): ByteSize = a match {
+      case Some(Inline(v)) => (v: SizeConversion).sizeIn(unit)
+      case _               => 0.bytes
     }
   }
 
@@ -65,7 +74,7 @@ object Attachments {
           }
       }
 
-      jsonFormat2(Attached.apply)
+      jsonFormat4(Attached.apply)
     }
   }
 

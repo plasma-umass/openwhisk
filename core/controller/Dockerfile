@@ -1,3 +1,6 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
+
 FROM scala
 
 # Install swagger-ui
@@ -9,11 +12,10 @@ RUN curl -sSL -o swagger-ui-v3.6.0.tar.gz --no-verbose https://github.com/swagge
 
 #
 # Copy app jars
-COPY build/distributions/controller.tar /
-RUN tar xf controller.tar
+ADD build/distributions/controller.tar /
 
 COPY init.sh /
 RUN chmod +x init.sh
 
 EXPOSE 8080
-CMD ["init.sh", "0"]
+CMD ["./init.sh", "0"]

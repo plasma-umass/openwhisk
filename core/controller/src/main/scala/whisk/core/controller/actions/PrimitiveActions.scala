@@ -17,40 +17,31 @@
 
 package whisk.core.controller.actions
 
-import java.time.Clock
-import java.time.Instant
+import java.time.{Clock, Instant}
 
-import scala.collection.mutable.Buffer
-import scala.concurrent.ExecutionContext
-import scala.concurrent.Future
-import scala.concurrent.Promise
-import scala.concurrent.duration._
-import scala.language.postfixOps
-import scala.util.Failure
-import scala.util.Success
-import scala.util.Try
-import akka.actor.Actor
-import akka.actor.ActorRef
 import akka.actor.ActorSystem
-import akka.actor.Cancellable
-import akka.actor.Props
+import akka.event.Logging.InfoLevel
 import spray.json._
-import whisk.common.Logging
-import whisk.common.LoggingMarkers
-import whisk.common.Scheduler
-import whisk.common.TransactionId
-import whisk.core.connector.ActivationMessage
+import whisk.common.tracing.WhiskTracerProvider
+import whisk.common.{Logging, LoggingMarkers, TransactionId, UserEvents}
+import whisk.core.connector.{ActivationMessage, EventMessage, MessagingProvider}
 import whisk.core.controller.WhiskServices
-import whisk.core.database.NoDocumentException
-import whisk.core.entitlement._
-import whisk.core.entitlement.Resource
+import whisk.core.database.{ActivationStore, NoDocumentException, UserContext}
+import whisk.core.entitlement.{Resource, _}
+import whisk.core.entity.ActivationResponse.ERROR_FIELD
 import whisk.core.entity._
+import whisk.core.controller.ProjectionDSL
 import whisk.core.entity.size.SizeInt
-import whisk.core.entity.types.ActivationStore
 import whisk.core.entity.types.EntityStore
 import whisk.http.Messages._
+import whisk.spi.SpiLoader
 import whisk.utils.ExecutionContextFactory.FutureExtensions
-import akka.event.Logging.InfoLevel
+
+import scala.collection.mutable.Buffer
+import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.language.postfixOps
+import scala.util.{Failure, Success}
 
 protected[actions] trait PrimitiveActions {
   /** The core collections require backend services to be injected in this trait. */
@@ -68,13 +59,17 @@ protected[actions] trait PrimitiveActions {
    *  The index of the active ack topic, this controller is listening for.
    *  Typically this is also the instance number of the controller
    */
-  protected val activeAckTopicIndex: InstanceId
+  protected val activeAckTopicIndex: ControllerInstanceId
 
   /** Database service to CRUD actions. */
   protected val entityStore: EntityStore
 
   /** Database service to get activations. */
   protected val activationStore: ActivationStore
+
+  /** Message producer. This is needed to write user-metrics. */
+  private val messagingProvider = SpiLoader.get[MessagingProvider]
+  private val producer = messagingProvider.getProducer(services.whiskConfig)
 
   /** A method that knows how to invoke a sequence of actions. */
   protected[actions] def invokeSequence(
@@ -87,6 +82,262 @@ protected[actions] trait PrimitiveActions {
     topmost: Boolean,
     atomicActionsCount: Int)(implicit transid: TransactionId): Future[(Either[ActivationId, WhiskActivation], Int)]
 
+   protected[controller] def invokeAction(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]]
+  
+  protected[actions] def invokeApp(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+      System.out.println (s"invoke app")      
+  
+      val JsObject(payloadMap) = payload.getOrElse(JsObject.empty)
+      var newPayload  = JsObject.empty
+      var nextAction = JsString.empty
+      if (payloadMap contains "action") {
+        nextAction = (payloadMap getOrElse ("action", JsObject.empty)).asInstanceOf[JsString]
+      }
+      else {
+        throw new Exception("No next action available", None.orNull)
+      }
+      
+      if (payloadMap contains "input") {
+        newPayload = (payloadMap getOrElse ("input", JsObject.empty)).asJsObject
+      }
+      else {
+        throw new Exception("No input to the action", None.orNull)
+      }
+      System.out.println (s"invokeApp: nextAction is $nextAction, input is $newPayload")
+      var nextActionVector: Vector[JsValue] = Vector[JsValue](nextAction)
+      nextActionVector = nextAction +: nextActionVector
+      val components: Vector[FullyQualifiedEntityName] = nextActionVector map (FullyQualifiedEntityName.serdes.read(_))
+            
+      val next = components (0).fullPath
+      // resolve and invoke next action
+      val fqn = (if (next.defaultPackage) EntityPath.DEFAULT.addPath(next) else next)
+        .resolveNamespace(user.namespace)
+        .toFullyQualifiedEntityName
+      val resource = Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString))
+      entitlementProvider
+        .check(user, Privilege.ACTIVATE, Set(resource), noThrottle = true)
+        .flatMap { _ =>
+          // successful entitlement check
+          WhiskActionMetaData
+            .resolveActionAndMergeParameters(entityStore, fqn)
+            .flatMap {
+              case next =>
+                // successful resolution
+                invokeAction(user, next, Option(newPayload), waitForResponse, cause)
+            }
+            //~ .recover {
+              //~ case _ =>
+                //~ // resolution failure
+                //~ ActivationResponse.applicationError(compositionComponentNotFound(next.asString))
+            //~ }
+        }
+        //~ .recover {
+          //~ case _ =>
+            //~ // failed entitlement check
+            //~ ActivationResponse.applicationError(compositionComponentNotAccessible(next.asString))
+        //~ }
+  }
+  
+  protected[actions] def invokeFork(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+      System.out.println (s"invoke fork")
+      /*var JsObject(map) = payload.getOrElse(JsObject.empty)
+      //var newPayloadMap : Map [String, JsValue]
+      if (map contains "input" && map contains "saved") {
+        
+      }
+      if (map contains "output" && map contains "saved") {
+        //Output from a previous projection invocation
+        
+      }
+      else if (!map contains "output" && !map contains "saved") {
+        //Input to first action of projection
+        
+      }*/
+      
+      val ForkExecMetaData(components) = action.exec
+      System.out.println (s"components is $components")
+      System.out.println (s"invokeFork: given payload is $payload")
+      
+      val JsObject(payloadMap) = payload.getOrElse(JsObject.empty)
+      var newPayload  = JsObject.empty
+      if ((payloadMap contains "input") && (payloadMap contains "saved")) {
+        newPayload = (payloadMap getOrElse ("input", JsObject.empty)).asJsObject
+      }
+      else {
+        newPayload = payload.getOrElse (JsObject.empty)
+      }
+      
+      System.out.println (s"invokeFork: new payload is $newPayload")
+      val next = components (0).fullPath
+      // resolve and invoke next action
+      val fqn = (if (next.defaultPackage) EntityPath.DEFAULT.addPath(next) else next)
+        .resolveNamespace(user.namespace)
+        .toFullyQualifiedEntityName
+      val resource = Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString))
+      entitlementProvider
+        .check(user, Privilege.ACTIVATE, Set(resource), noThrottle = true)
+        .flatMap { _ =>
+          // successful entitlement check
+          WhiskActionMetaData
+            .resolveActionAndMergeParameters(entityStore, fqn)
+            .flatMap {
+              case next =>
+                // successful resolution
+                val response = invokeAction(user, next, Option(newPayload), waitForResponse, cause)
+                response.map {
+                  case Right (activation) => { 
+                    val WhiskActivation (_ns, _name, _subject, _id, _start, _end, _cause, 
+                                         _response, _logs, _version, _publish, _ann, _duration) = activation
+                    
+                    var newResponseJSON = JsObject.empty
+                    var result = _response
+
+                    val outputPayload = _response.result.map(_.asJsObject)
+                    val payloadContent = outputPayload getOrElse JsObject.empty
+                    val errorField = payloadContent.fields.get(ActivationResponse.ERROR_FIELD)
+
+                    if (errorField.isEmpty) {
+                      val ActivationResponse (code, responseJsObject) = _response
+                      System.out.println(s"invokeFork: responseJsObject = $responseJsObject")
+                      var newResponseMap  = Map[String, JsValue] ()
+                      newResponseMap += ("output" -> responseJsObject.getOrElse(JsObject.empty))
+                      newResponseMap += ("saved" -> payloadMap.getOrElse ("saved", JsObject.empty))
+                      newResponseJSON = JsObject(newResponseMap)
+                      result = ActivationResponse.success (Option(newResponseJSON))
+                    } else {
+                      assert(errorField.isDefined)
+                    }
+
+                    System.out.println(s"invokeFork: result $result")
+                    val newActivation = WhiskActivation(namespace = _ns,
+                           name = _name,
+                           subject = _subject,
+                           activationId = _id,
+                           start = _start,
+                           end = _end,
+                           cause = _cause,
+                           response = result,
+                           logs = _logs,
+                           version = _version,
+                           publish = _publish,
+                           annotations = _ann,
+                           duration = _duration)
+                           
+                   Right(newActivation)
+                         }
+                  case somethingelse => somethingelse
+                }
+            }
+            //~ .recover {
+              //~ case _ =>
+                //~ // resolution failure
+                //~ ActivationResponse.applicationError(compositionComponentNotFound(next.asString))
+            //~ }
+        }
+        //~ .recover {
+          //~ case _ =>
+            //~ // failed entitlement check
+            //~ ActivationResponse.applicationError(compositionComponentNotAccessible(next.asString))
+        //~ }
+  }
+  
+  protected[actions] def invokeProjection(
+    user: Identity,
+    action: WhiskActionMetaData,
+    payload: Option[JsObject],
+    waitForResponse: Option[FiniteDuration],
+    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+      
+      val start = Instant.now(Clock.systemUTC())
+      System.out.println (s"invoke projection")
+      val JsObject(map) = payload.getOrElse(JsObject.empty)
+      var newMap = Map [String, JsValue] ()
+      //if (map contains "input" && map contains "saved") {
+        //Should Not happen
+      //  logging.info (s"projection $action 's input contains input field")
+      //}
+      
+      if ((map contains "output") && (map contains "saved")) {
+        //Output from a previous projection invocation
+        newMap += ("input" -> map("output"))
+        newMap += ("saved" -> map("saved"))
+      }
+      else if (! (map contains "output") && (map contains "input")) {
+        //Input to first action of projection
+        newMap = map
+      } else {
+        throw new IllegalArgumentException (s"Incorrect given payload $payload")
+      }
+      
+      var updatedPayload = JsObject(newMap)
+      val ProjectionExecMetaData(code) = action.exec
+      System.out.println (s"invokeProjection:281 code is $code")
+      System.out.println (s"invokeProjection:282 updatedPayload is $updatedPayload")
+      val dslResult = (new ProjectionDSL).apply(code, updatedPayload)
+      //newMap = newMap + ("input" -> dslResult)
+      //updatedPayload = dslResult
+      System.out.println (s"invokeProjection:284 dslResult: $dslResult for code $code and payload ${updatedPayload}")
+      val end = Instant.now(Clock.systemUTC())
+  
+      // create the whisk activation
+      val activation = WhiskActivation(
+        namespace = user.namespace.name.toPath,
+        name = action.name,
+        user.subject,
+        activationId = activationIdFactory.make(),
+        start = start,
+        end = end,
+        cause = cause,
+        response = ActivationResponse.success(Option(dslResult)),
+        version = action.version,
+        publish = false,
+        //~ annotations = Parameters(WhiskActivation.topmostAnnotation, JsBoolean(session.cause.isEmpty)) ++
+          //~ Parameters(WhiskActivation.pathAnnotation, JsString(session.action.fullyQualifiedName(false).asString)) ++
+          //~ Parameters(WhiskActivation.kindAnnotation, JsString(Exec.SEQUENCE)) ++
+          //~ Parameters(WhiskActivation.conductorAnnotation, JsBoolean(true)) ++
+          //~ causedBy ++
+          //~ sequenceLimits,
+        duration = Some(end.getEpochSecond() - start.getEpochSecond()))
+
+      val context = UserContext(user)
+
+      logging.debug(this, s"recording activation '${activation.activationId}'")
+      activationStore.store(activation, context)(transid, notifier = None) onComplete {
+        case Success(id) => logging.debug(this, s"recorded activation")
+        case Failure(t) =>
+          logging.error(
+            this,
+            s"failed to record activation ${activation.activationId} with error ${t.getLocalizedMessage}")
+      }
+  
+      Future.successful (Right(activation))
+      
+            //~ .recover {
+              //~ case _ =>
+                //~ // resolution failure
+                //~ ActivationResponse.applicationError(compositionComponentNotFound(next.asString))
+            //~ }
+        //~ .recover {
+          //~ case _ =>
+            //~ // failed entitlement check
+            //~ ActivationResponse.applicationError(compositionComponentNotAccessible(next.asString))
+        //~ }
+  }
   /**
    * A method that knows how to invoke a single primitive action or a composition.
    *
@@ -156,19 +407,10 @@ protected[actions] trait PrimitiveActions {
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
-
+    
     // merge package parameters with action (action parameters supersede), then merge in payload
     val args = action.parameters merge payload
-    val message = ActivationMessage(
-      transid,
-      FullyQualifiedEntityName(action.namespace, action.name, Some(action.version)),
-      action.rev,
-      user,
-      activationIdFactory.make(), // activation id created here
-      activeAckTopicIndex,
-      waitForResponse.isDefined,
-      args,
-      cause = cause)
+    val activationId = activationIdFactory.make()
 
     val startActivation = transid.started(
       this,
@@ -177,26 +419,40 @@ protected[actions] trait PrimitiveActions {
         .getOrElse(LoggingMarkers.CONTROLLER_ACTIVATION),
       logLevel = InfoLevel)
     val startLoadbalancer =
-      transid.started(this, LoggingMarkers.CONTROLLER_LOADBALANCER, s"action activation id: ${message.activationId}")
+      transid.started(this, LoggingMarkers.CONTROLLER_LOADBALANCER, s"action activation id: ${activationId}")
+
+    val message = ActivationMessage(
+      transid,
+      FullyQualifiedEntityName(action.namespace, action.name, Some(action.version)),
+      action.rev,
+      user,
+      activationId, // activation id created here
+      activeAckTopicIndex,
+      waitForResponse.isDefined,
+      args,
+      cause = cause,
+      WhiskTracerProvider.tracer.getTraceContext(transid))
+
     val postedFuture = loadBalancer.publish(action, message)
 
-    postedFuture.flatMap { activeAckResponse =>
-      // successfully posted activation request to the message bus
-      transid.finished(this, startLoadbalancer)
-
+    postedFuture andThen {
+      case Success(_) => transid.finished(this, startLoadbalancer)
+      case Failure(e) => transid.failed(this, startLoadbalancer, e.getMessage)
+    } flatMap { activeAckResponse =>
       // is caller waiting for the result of the activation?
       waitForResponse
         .map { timeout =>
           // yes, then wait for the activation response from the message bus
           // (known as the active response or active ack)
           waitForActivationResponse(user, message.activationId, timeout, activeAckResponse)
-            .andThen { case _ => transid.finished(this, startActivation) }
         }
         .getOrElse {
           // no, return the activation id
-          transid.finished(this, startActivation)
           Future.successful(Left(message.activationId))
         }
+    } andThen {
+      case Success(_) => transid.finished(this, startActivation)
+      case Failure(e) => transid.failed(this, startActivation, e.getMessage)
     }
   }
 
@@ -282,6 +538,8 @@ protected[actions] trait PrimitiveActions {
       accounting = accounting.getOrElse(CompositionAccounting()), // share accounting with caller
       logs = Buffer.empty)
 
+    logging.info(this, s"invoking composition $action topmost ${cause.isEmpty} activationid '${session.activationId}'")
+
     val response: Future[Either[ActivationId, WhiskActivation]] =
       invokeConductor(user, payload, session).map(response => Right(completeActivation(user, session, response)))
 
@@ -318,7 +576,7 @@ protected[actions] trait PrimitiveActions {
     } else {
       // inject state into payload if any
       val params = session.state
-        .map(state => Some(JsObject(payload.getOrElse(JsObject()).fields ++ state.fields)))
+        .map(state => Some(JsObject(payload.getOrElse(JsObject.empty).fields ++ state.fields)))
         .getOrElse(payload)
 
       // invoke conductor action
@@ -355,46 +613,69 @@ protected[actions] trait PrimitiveActions {
               // no next action, end composition execution, return to caller
               Future.successful(ActivationResponse(activation.response.statusCode, Some(params.getOrElse(result))))
             case Some(next) =>
-              Try(next.convertTo[EntityPath]) match {
-                case Failure(t) =>
-                  // parsing failure
-                  Future.successful(ActivationResponse.applicationError(compositionComponentInvalid(next)))
-                case Success(_) if session.accounting.components >= actionSequenceLimit =>
-                  // composition is too long
-                  Future.successful(ActivationResponse.applicationError(compositionIsTooLong))
-                case Success(next) =>
-                  // resolve and invoke next action
-                  val fqn = (if (next.defaultPackage) EntityPath.DEFAULT.addPath(next) else next)
-                    .resolveNamespace(user.namespace)
-                    .toFullyQualifiedEntityName
-                  val resource = Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString))
-                  entitlementProvider
-                    .check(user, Privilege.ACTIVATE, Set(resource), noThrottle = true)
-                    .flatMap { _ =>
-                      // successful entitlement check
-                      WhiskActionMetaData
-                        .resolveActionAndMergeParameters(entityStore, fqn)
-                        .flatMap {
-                          case next =>
-                            // successful resolution
-                            invokeComponent(user, action = next, payload = params, session)
-                        }
-                        .recover {
-                          case _ =>
-                            // resolution failure
-                            ActivationResponse.applicationError(compositionComponentNotFound(next.asString))
-                        }
-                    }
-                    .recover {
-                      case _ =>
-                        // failed entitlement check
-                        ActivationResponse.applicationError(compositionComponentNotAccessible(next.asString))
-                    }
+              FullyQualifiedEntityName.resolveName(next, user.namespace.name) match {
+                case Some(fqn) if session.accounting.components < actionSequenceLimit =>
+                  tryInvokeNext(user, fqn, params, session)
+
+                case Some(_) => // composition is too long
+                  invokeConductor(
+                    user,
+                    payload = Some(JsObject(ERROR_FIELD -> JsString(compositionIsTooLong))),
+                    session = session)
+
+                case None => // parsing failure
+                  invokeConductor(
+                    user,
+                    payload = Some(JsObject(ERROR_FIELD -> JsString(compositionComponentInvalid(next)))),
+                    session = session)
+
               }
           }
       }
     }
 
+  }
+
+  /**
+   * Checks if the user is entitled to invoke the next action and invokes it.
+   *
+   * @param user the subject
+   * @param fqn the name of the action
+   * @param params parameters for the action
+   * @param session the session for the current activation
+   * @return promise for the eventual activation
+   */
+  private def tryInvokeNext(user: Identity, fqn: FullyQualifiedEntityName, params: Option[JsObject], session: Session)(
+    implicit transid: TransactionId): Future[ActivationResponse] = {
+    val resource = Resource(fqn.path, Collection(Collection.ACTIONS), Some(fqn.name.asString))
+    entitlementProvider
+      .check(user, Privilege.ACTIVATE, Set(resource), noThrottle = true)
+      .flatMap { _ =>
+        // successful entitlement check
+        WhiskActionMetaData
+          .resolveActionAndMergeParameters(entityStore, fqn)
+          .flatMap {
+            case next =>
+              // successful resolution
+              invokeComponent(user, action = next, payload = params, session)
+          }
+          .recoverWith {
+            case _ =>
+              // resolution failure
+              invokeConductor(
+                user,
+                payload = Some(JsObject(ERROR_FIELD -> JsString(compositionComponentNotFound(fqn.asString)))),
+                session = session)
+          }
+      }
+      .recoverWith {
+        case _ =>
+          // failed entitlement check
+          invokeConductor(
+            user,
+            payload = Some(JsObject(ERROR_FIELD -> JsString(compositionComponentNotAccessible(fqn.asString)))),
+            session = session)
+      }
   }
 
   /**
@@ -499,6 +780,8 @@ protected[actions] trait PrimitiveActions {
   private def completeActivation(user: Identity, session: Session, response: ActivationResponse)(
     implicit transid: TransactionId): WhiskActivation = {
 
+    val context = UserContext(user)
+
     // compute max memory
     val sequenceLimits = Parameters(
       WhiskActivation.limitsAnnotation,
@@ -513,7 +796,7 @@ protected[actions] trait PrimitiveActions {
 
     // create the whisk activation
     val activation = WhiskActivation(
-      namespace = user.namespace.toPath,
+      namespace = user.namespace.name.toPath,
       name = session.action.name,
       user.subject,
       activationId = session.activationId,
@@ -532,14 +815,14 @@ protected[actions] trait PrimitiveActions {
         sequenceLimits,
       duration = Some(session.duration))
 
-    logging.debug(this, s"recording activation '${activation.activationId}'")
-    WhiskActivation.put(activationStore, activation)(transid, notifier = None) onComplete {
-      case Success(id) => logging.debug(this, s"recorded activation")
-      case Failure(t) =>
-        logging.error(
-          this,
-          s"failed to record activation ${activation.activationId} with error ${t.getLocalizedMessage}")
+    if (UserEvents.enabled) {
+      EventMessage.from(activation, s"controller${activeAckTopicIndex.asString}", user.namespace.uuid) match {
+        case Success(msg) => UserEvents.send(producer, msg)
+        case Failure(t)   => logging.warn(this, s"activation event was not sent: $t")
+      }
     }
+
+    activationStore.store(activation, context)(transid, notifier = None)
 
     activation
   }
@@ -558,158 +841,64 @@ protected[actions] trait PrimitiveActions {
                                         totalWaitTime: FiniteDuration,
                                         activeAckResponse: Future[Either[ActivationId, WhiskActivation]])(
     implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
-    // this is the promise which active ack or db polling will try to complete via:
-    // 1. active ack response, or
-    // 2. failing active ack (due to active ack timeout), fall over to db polling
-    // 3. timeout on db polling => converts activation to non-blocking (returns activation id only)
-    // 4. internal error message
-    val docid = new DocId(WhiskEntity.qualifiedName(user.namespace.toPath, activationId))
-    val (promise, finisher) = ActivationFinisher.props({ () =>
-      WhiskActivation.get(activationStore, docid)
-    })
-
+    val context = UserContext(user)
+    val result = Promise[Either[ActivationId, WhiskActivation]]
+    val docid = new DocId(WhiskEntity.qualifiedName(user.namespace.name.toPath, activationId))
     logging.debug(this, s"action activation will block for result upto $totalWaitTime")
 
-    activeAckResponse map {
-      case result @ Right(_) =>
-        // activation complete, result is available
-        finisher ! ActivationFinisher.Finish(result)
-
-      case _ =>
-        // active ack received but it does not carry the response,
-        // no result available except by polling the db
-        logging.warn(this, "pre-emptively polling db because active ack is missing result")
-        finisher ! Scheduler.WorkOnceNow
+    // 1. Wait for the active-ack to happen. Either immediately resolve the promise or poll the database quickly
+    //    in case of an incomplete active-ack (record too large for example).
+    activeAckResponse.foreach {
+      case Right(activation) => result.trySuccess(Right(activation))
+      case _                 => pollActivation(docid, context, result, i => 1.seconds + (2.seconds * i), maxRetries = 4)
     }
 
-    // return the promise which is either fulfilled by active ack, polling from the database,
-    // or the timeout alternative when the allowed duration expires (i.e., the action took
-    // longer than the permitted, per totalWaitTime).
-    promise.withAlternativeAfterTimeout(
-      totalWaitTime, {
-        Future.successful(Left(activationId)).andThen {
-          // result no longer interesting; terminate the finisher/shut down db polling if necessary
-          case _ => actorSystem.stop(finisher)
+    // 2. Poll the database slowly in case the active-ack never arrives
+    pollActivation(docid, context, result, _ => 15.seconds)
+
+    // 3. Timeout forces a fallback to activationId
+    val timeout = actorSystem.scheduler.scheduleOnce(totalWaitTime)(result.trySuccess(Left(activationId)))
+
+    result.future.andThen {
+      case _ => timeout.cancel()
+    }
+  }
+
+  /**
+   * Polls the database for an activation.
+   *
+   * Does not use Future composition because an early exit is wanted, once any possible external source resolved the
+   * Promise.
+   *
+   * @param docid the docid to poll for
+   * @param result promise to resolve on result. Is also used to abort polling once completed.
+   */
+  private def pollActivation(docid: DocId,
+                             context: UserContext,
+                             result: Promise[Either[ActivationId, WhiskActivation]],
+                             wait: Int => FiniteDuration,
+                             retries: Int = 0,
+                             maxRetries: Int = Int.MaxValue)(implicit transid: TransactionId): Unit = {
+    if (!result.isCompleted && retries < maxRetries) {
+      val schedule = actorSystem.scheduler.scheduleOnce(wait(retries)) {
+        activationStore.get(ActivationId(docid.asString), context).onComplete {
+          case Success(activation) =>
+            transid.mark(
+              this,
+              LoggingMarkers.CONTROLLER_ACTIVATION_BLOCKING_DATABASE_RETRIEVAL,
+              s"retrieved activation for blocking invocation via DB polling",
+              logLevel = InfoLevel)
+            result.trySuccess(Right(activation))
+          case Failure(_: NoDocumentException) => pollActivation(docid, context, result, wait, retries + 1, maxRetries)
+          case Failure(t: Throwable)           => result.tryFailure(t)
         }
-      })
+      }
+
+      // Halt the schedule if the result is provided during one execution
+      result.future.onComplete(_ => schedule.cancel())
+    }
   }
 
   /** Max atomic action count allowed for sequences */
   private lazy val actionSequenceLimit = whiskConfig.actionSequenceLimit.toInt
-}
-
-/** Companion to the ActivationFinisher. */
-protected[actions] object ActivationFinisher {
-  case class Finish(activation: Right[ActivationId, WhiskActivation])
-
-  private type ActivationLookup = () => Future[WhiskActivation]
-
-  /** Periodically polls the db to cover missing active acks. */
-  private val datastorePollPeriodForActivation = 15.seconds
-
-  /**
-   * In case of a partial active ack where it is know an activation completed
-   * but the result could not be sent over the bus, use this periodicity to poll
-   * for a result.
-   */
-  private val datastorePreemptivePolling = Seq(1.second, 3.seconds, 5.seconds, 7.seconds)
-
-  def props(activationLookup: ActivationLookup)(
-    implicit transid: TransactionId,
-    actorSystem: ActorSystem,
-    executionContext: ExecutionContext,
-    logging: Logging): (Future[Either[ActivationId, WhiskActivation]], ActorRef) = {
-
-    val (p, _, f) = props(activationLookup, datastorePollPeriodForActivation, datastorePreemptivePolling)
-    (p.future, f) // hides the polling actor
-  }
-
-  /**
-   * Creates the finishing actor.
-   * This is factored for testing.
-   */
-  protected[actions] def props(activationLookup: ActivationLookup,
-                               slowPoll: FiniteDuration,
-                               fastPolls: Seq[FiniteDuration])(
-    implicit transid: TransactionId,
-    actorSystem: ActorSystem,
-    executionContext: ExecutionContext,
-    logging: Logging): (Promise[Either[ActivationId, WhiskActivation]], ActorRef, ActorRef) = {
-
-    // this is strictly completed by the finishing actor
-    val promise = Promise[Either[ActivationId, WhiskActivation]]
-    val dbpoller = poller(slowPoll, promise, activationLookup)
-    val finisher = Props(new ActivationFinisher(dbpoller, fastPolls, promise))
-
-    (promise, dbpoller, actorSystem.actorOf(finisher))
-  }
-
-  /**
-   * An actor to complete a blocking activation request. It encapsulates a promise
-   * to be completed when the result is ready. This may happen in one of two ways.
-   * An active ack message is relayed to this actor to complete the promise when
-   * the active ack is received. Or in case of a partial/missing active ack, an
-   * explicitly scheduled datastore poll of the activation record, if found, will
-   * complete the transaction. When the promise is fulfilled, the actor self destructs.
-   */
-  private class ActivationFinisher(poller: ActorRef, // the activation poller
-                                   fastPollPeriods: Seq[FiniteDuration],
-                                   promise: Promise[Either[ActivationId, WhiskActivation]])(
-    implicit transid: TransactionId,
-    actorSystem: ActorSystem,
-    executionContext: ExecutionContext,
-    logging: Logging)
-      extends Actor {
-
-    // when the future completes, self-destruct
-    promise.future.andThen { case _ => shutdown() }
-
-    var preemptiveMsgs = Vector.empty[Cancellable]
-
-    def receive = {
-      case ActivationFinisher.Finish(activation) =>
-        promise.trySuccess(activation)
-
-      case msg @ Scheduler.WorkOnceNow =>
-        // try up to three times when pre-emptying the schedule
-        fastPollPeriods.foreach { s =>
-          preemptiveMsgs = preemptiveMsgs :+ context.system.scheduler.scheduleOnce(s, poller, msg)
-        }
-    }
-
-    def shutdown(): Unit = Option(context).foreach(_.stop(self))
-
-    override def postStop() = {
-      logging.debug(this, "finisher shutdown")
-      preemptiveMsgs.foreach(_.cancel())
-      preemptiveMsgs = Vector.empty
-      context.stop(poller)
-    }
-  }
-
-  /**
-   * This creates the inner datastore poller for the completed activation.
-   * It is a factory method to facilitate testing.
-   */
-  private def poller(slowPollPeriod: FiniteDuration,
-                     promise: Promise[Either[ActivationId, WhiskActivation]],
-                     activationLookup: ActivationLookup)(implicit transid: TransactionId,
-                                                         actorSystem: ActorSystem,
-                                                         executionContext: ExecutionContext,
-                                                         logging: Logging): ActorRef = {
-    Scheduler.scheduleWaitAtMost(slowPollPeriod, initialDelay = slowPollPeriod, name = "dbpoll")(() => {
-      if (!promise.isCompleted) {
-        activationLookup() map {
-          // complete the future, which in turn will poison pill this scheduler
-          activation =>
-            promise.trySuccess(Right(activation.withoutLogs)) // logs excluded on blocking calls
-        } andThen {
-          case Failure(e: NoDocumentException) => // do nothing, scheduler will reschedule another poll
-          case Failure(t: Throwable) => // something went wrong, abort
-            logging.error(this, s"failed while waiting on result: ${t.getMessage}")
-            promise.tryFailure(t) // complete the future, which in turn will poison pill this scheduler
-        }
-      } else Future.successful({}) // the scheduler will be halted because the promise is now resolved
-    })
-  }
 }

@@ -17,9 +17,10 @@
 
 package whisk.core.entity
 
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 import spray.json.DefaultJsonProtocol._
 import spray.json._
+
 import scala.language.postfixOps
 import whisk.core.entity.size.SizeInt
 import whisk.core.entity.size.SizeString
@@ -41,10 +42,7 @@ protected[core] class Parameters protected[entity] (private val params: Map[Para
    */
   def size = {
     params
-      .map {
-        case (name, value) =>
-          name.size + value.size
-      }
+      .map { case (name, value) => name.size + value.size }
       .foldLeft(0 B)(_ + _)
   }
 
@@ -77,14 +75,14 @@ protected[core] class Parameters protected[entity] (private val params: Map[Para
     params.keySet filter (params(_).isDefined) map (_.name)
   }
 
-  protected[core] def toJsArray =
+  protected[core] def toJsArray = {
     JsArray(params map { p =>
       JsObject("key" -> p._1.name.toJson, "value" -> p._2.value.toJson)
     } toSeq: _*)
-  protected[core] def toJsObject =
-    JsObject(params map { p =>
-      (p._1.name -> p._2.value.toJson)
-    })
+  }
+
+  protected[core] def toJsObject = JsObject(params.map(p => (p._1.name -> p._2.value.toJson)))
+
   override def toString = toJsArray.compactPrint
 
   /**
@@ -92,7 +90,7 @@ protected[core] class Parameters protected[entity] (private val params: Map[Para
    * In case of overlap, the keys in the payload supersede.
    */
   protected[core] def merge(payload: Option[JsObject]): Some[JsObject] = {
-    val args = payload getOrElse JsObject()
+    val args = payload getOrElse JsObject.empty
     Some { (toJsObject.fields ++ args.fields).toJson.asJsObject }
   }
 
@@ -100,7 +98,10 @@ protected[core] class Parameters protected[entity] (private val params: Map[Para
   protected[core] def get(p: String): Option[JsValue] = params.get(new ParameterName(p)).map(_.value)
 
   /** Retrieves parameter by name if it exists. Returns that parameter if it is deserializable to {@code T} */
-  protected[core] def getAs[T: JsonReader](p: String): Option[T] = get(p).flatMap(js => Try(js.convertTo[T]).toOption)
+  protected[core] def getAs[T: JsonReader](p: String): Try[T] =
+    get(p)
+      .fold[Try[JsValue]](Failure(new IllegalStateException(s"key '$p' does not exist")))(Success.apply)
+      .flatMap(js => Try(js.convertTo[T]))
 
   /** Retrieves parameter by name if it exist. Returns true if parameter exists and has truthy value. */
   protected[core] def isTruthy(p: String): Boolean = {
@@ -164,7 +165,7 @@ protected[core] object Parameters extends ArgNormalizer[Parameters] {
   protected[core] val Feed = "feed"
   protected[core] val sizeLimit = 1 MB
 
-  protected[core] def apply(): Parameters = new Parameters(Map())
+  protected[core] def apply(): Parameters = new Parameters(Map.empty)
 
   /**
    * Creates a parameter tuple from a pair of strings.

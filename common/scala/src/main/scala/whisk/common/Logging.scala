@@ -18,15 +18,12 @@
 package whisk.common
 
 import java.io.PrintStream
-import java.time.Clock
-import java.time.Instant
-import java.time.ZoneId
+import java.time.{Clock, Instant, ZoneId}
 import java.time.format.DateTimeFormatter
-
-import akka.event.Logging.{DebugLevel, ErrorLevel, InfoLevel, WarningLevel}
-import akka.event.Logging.LogLevel
+import akka.event.Logging._
 import akka.event.LoggingAdapter
 import kamon.Kamon
+import whisk.core.entity.ControllerInstanceId
 
 trait Logging {
 
@@ -137,7 +134,7 @@ class PrintStreamLogging(outputStream: PrintStream = Console.out) extends Loggin
  */
 case class LogMarker(token: LogMarkerToken, deltaToTransactionStart: Long, deltaToMarkerStart: Option[Long] = None) {
   override def toString() = {
-    val parts = Seq(LogMarker.keyword, token.toString, deltaToTransactionStart) ++ deltaToMarkerStart
+    val parts = Seq(LogMarker.keyword, token.toStringWithSubAction, deltaToTransactionStart) ++ deltaToMarkerStart
     "[" + parts.mkString(":") + "]"
   }
 }
@@ -164,45 +161,80 @@ private object Logging {
     if (simpleName.endsWith("$")) simpleName.dropRight(1)
     else simpleName
   }
-
 }
 
 private object Emitter {
   val timeFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneId.of("UTC"))
 }
 
-case class LogMarkerToken(component: String, action: String, state: String) {
-  override def toString() = component + "_" + action + "_" + state
+/**
+ * Used to record log message and make a metric name.
+ *
+ * @param component Component like invoker, controller, and docker. It is defined in LoggingMarkers.
+ * @param action Action of the component.
+ * @param state State of the action.
+ * @param subAction more specific identifier for "action", like `runc.resume`
+ * @param tags tags can be used for whatever granularity you might need.
+ */
+case class LogMarkerToken(component: String,
+                          action: String,
+                          state: String,
+                          subAction: Option[String] = None,
+                          tags: Map[String, String] = Map.empty) {
+
+  override val toString = component + "_" + action + "_" + state
+  val toStringWithSubAction =
+    subAction.map(sa => component + "_" + action + "." + sa + "_" + state).getOrElse(toString)
 
   def asFinish = copy(state = LoggingMarkers.finish)
   def asError = copy(state = LoggingMarkers.error)
 }
 
 object LogMarkerToken {
-  def parse(s: String) = {
+
+  def parse(string: String) = {
     // Per convention the components are guaranteed to not contain '_'
     // thus it's safe to split at '_' to get the components
-    val Array(component, action, state) = s.split("_")
-    LogMarkerToken(component, action, state)
+    val Array(component, action, state) = string.split('_')
+
+    val (generalAction, subAction) = action.split('.').toList match {
+      case Nil         => throw new IllegalArgumentException("LogMarkerToken malformed")
+      case a :: Nil    => (a, None)
+      case a :: s :: _ => (a, Some(s))
+    }
+
+    LogMarkerToken(component, generalAction, state, subAction)
   }
+
 }
 
 object MetricEmitter {
 
   val metrics = Kamon.metrics
 
-  def emitCounterMetric(token: LogMarkerToken): Unit = {
-    metrics
-      .counter(token.toString)
-      .increment(1)
+  def emitCounterMetric(token: LogMarkerToken, times: Long = 1): Unit = {
+    if (TransactionId.metricsKamon) {
+      if (TransactionId.metricsKamonTags) {
+        metrics
+          .counter(token.toString, token.tags)
+          .increment(times)
+      } else {
+        metrics.counter(token.toStringWithSubAction).increment(times)
+      }
+    }
   }
 
   def emitHistogramMetric(token: LogMarkerToken, value: Long): Unit = {
-    metrics
-      .histogram(token.toString)
-      .record(value)
+    if (TransactionId.metricsKamon) {
+      if (TransactionId.metricsKamonTags) {
+        metrics
+          .histogram(token.toString, token.tags)
+          .record(value)
+      } else {
+        metrics.histogram(token.toStringWithSubAction).record(value)
+      }
+    }
   }
-
 }
 
 object LoggingMarkers {
@@ -218,15 +250,18 @@ object LoggingMarkers {
   private val activation = "activation"
   private val kafka = "kafka"
   private val loadbalancer = "loadbalancer"
+  private val containerClient = "containerClient"
 
   /*
    * Controller related markers
    */
-  def CONTROLLER_STARTUP(i: Int) = LogMarkerToken(controller, s"startup$i", count)
+  def CONTROLLER_STARTUP(id: String) = LogMarkerToken(controller, s"startup$id", count)
 
   // Time of the activation in controller until it is delivered to Kafka
   val CONTROLLER_ACTIVATION = LogMarkerToken(controller, activation, start)
   val CONTROLLER_ACTIVATION_BLOCKING = LogMarkerToken(controller, "blockingActivation", start)
+  val CONTROLLER_ACTIVATION_BLOCKING_DATABASE_RETRIEVAL =
+    LogMarkerToken(controller, "blockingActivationDatabaseRetrieval", count)
 
   // Time that is needed load balance the activation
   val CONTROLLER_LOADBALANCER = LogMarkerToken(controller, loadbalancer, start)
@@ -240,10 +275,14 @@ object LoggingMarkers {
   def INVOKER_STARTUP(i: Int) = LogMarkerToken(invoker, s"startup$i", count)
 
   // Check invoker healthy state from loadbalancer
-  val LOADBALANCER_INVOKER_OFFLINE = LogMarkerToken(loadbalancer, "invokerOffline", count)
-  val LOADBALANCER_INVOKER_UNHEALTHY = LogMarkerToken(loadbalancer, "invokerUnhealthy", count)
-  def LOADBALANCER_ACTIVATION_START(namespaceId: String) =
-    LogMarkerToken(loadbalancer, s"activations_$namespaceId", count)
+  def LOADBALANCER_INVOKER_STATUS_CHANGE(state: String) =
+    LogMarkerToken(loadbalancer, "invokerState", count, Some(state))
+  val LOADBALANCER_ACTIVATION_START = LogMarkerToken(loadbalancer, "activations", count)
+
+  def LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance: ControllerInstanceId) =
+    LogMarkerToken(loadbalancer + controllerInstance.asString, "activationsInflight", count)
+  def LOADBALANCER_MEMORY_INFLIGHT(controllerInstance: ControllerInstanceId) =
+    LogMarkerToken(loadbalancer + controllerInstance.asString, "memoryInflight", count)
 
   // Time that is needed to execute the action
   val INVOKER_ACTIVATION_RUN = LogMarkerToken(invoker, "activationRun", start)
@@ -256,10 +295,17 @@ object LoggingMarkers {
 
   // Time in invoker
   val INVOKER_ACTIVATION = LogMarkerToken(invoker, activation, start)
-  def INVOKER_DOCKER_CMD(cmd: String) = LogMarkerToken(invoker, s"docker.$cmd", start)
-  def INVOKER_RUNC_CMD(cmd: String) = LogMarkerToken(invoker, s"runc.$cmd", start)
-  def INVOKER_CONTAINER_START(actionName: String, namespaceName: String, containerState: String) =
-    LogMarkerToken(invoker, s"container_start_${containerState}_${namespaceName}_$actionName", count)
+  def INVOKER_DOCKER_CMD(cmd: String) = LogMarkerToken(invoker, "docker", start, Some(cmd), Map("cmd" -> cmd))
+  def INVOKER_RUNC_CMD(cmd: String) = LogMarkerToken(invoker, "runc", start, Some(cmd), Map("cmd" -> cmd))
+  def INVOKER_KUBECTL_CMD(cmd: String) = LogMarkerToken(invoker, "kubectl", start, Some(cmd), Map("cmd" -> cmd))
+  def INVOKER_CONTAINER_START(containerState: String) =
+    LogMarkerToken(invoker, "containerStart", count, Some(containerState), Map("containerState" -> containerState))
+  val CONTAINER_CLIENT_RETRIES =
+    LogMarkerToken(containerClient, "retries", count)
+
+  // Kafka related markers
+  def KAFKA_QUEUE(topic: String) = LogMarkerToken(kafka, topic, count)
+  def KAFKA_MESSAGE_DELAY(topic: String) = LogMarkerToken(kafka, topic, start, Some("delay"))
 
   /*
    * General markers
@@ -273,5 +319,7 @@ object LoggingMarkers {
   val DATABASE_QUERY = LogMarkerToken(database, "queryView", start)
   val DATABASE_ATT_GET = LogMarkerToken(database, "getDocumentAttachment", start)
   val DATABASE_ATT_SAVE = LogMarkerToken(database, "saveDocumentAttachment", start)
+  val DATABASE_ATT_DELETE = LogMarkerToken(database, "deleteDocumentAttachment", start)
+  val DATABASE_ATTS_DELETE = LogMarkerToken(database, "deleteDocumentAttachments", start)
   val DATABASE_BATCH_SIZE = LogMarkerToken(database, "batchSize", count)
 }

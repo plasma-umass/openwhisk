@@ -288,10 +288,10 @@ class DockerClientTests
       logLines.head should include((Seq(dockerCommand, cmd) ++ args).mkString(" "))
 
       val start = LogMarker.parse(logLines.head)
-      start.token shouldBe INVOKER_DOCKER_CMD(cmd)
+      start.token.toStringWithSubAction shouldBe INVOKER_DOCKER_CMD(cmd).toStringWithSubAction
 
       val end = LogMarker.parse(logLines.last)
-      end.token shouldBe INVOKER_DOCKER_CMD(cmd).asFinish
+      end.token.toStringWithSubAction shouldBe INVOKER_DOCKER_CMD(cmd).asFinish.toStringWithSubAction
 
       stream.reset()
       result
@@ -320,10 +320,10 @@ class DockerClientTests
       a[RuntimeException] should be thrownBy await(f)
 
       val start = LogMarker.parse(logLines.head)
-      start.token shouldBe INVOKER_DOCKER_CMD(cmd)
+      start.token.toStringWithSubAction shouldBe INVOKER_DOCKER_CMD(cmd).toStringWithSubAction
 
       val end = LogMarker.parse(logLines.last)
-      end.token shouldBe INVOKER_DOCKER_CMD(cmd).asError
+      end.token.toStringWithSubAction shouldBe INVOKER_DOCKER_CMD(cmd).asError.toStringWithSubAction
 
       stream.reset()
     }
@@ -346,7 +346,7 @@ class DockerClientTests
           stderr =
             """/usr/bin/docker: Error response from daemon: mkdir /var/run/docker.1.1/libcontainerd.1.1/55db56ee082239428b27d3728b4dd324c09068458aad9825727d5bfc1bba6d52: no space left on device."""))
     }
-    val bdc = the[BrokenDockerContainer] thrownBy await(dc.run("image", Seq()))
+    val bdc = the[BrokenDockerContainer] thrownBy await(dc.run("image", Seq.empty))
     bdc.id shouldBe id
   }
 
@@ -354,7 +354,7 @@ class DockerClientTests
     def runAndVerify(pre: ProcessRunningException, clue: String) = {
       val dc = dockerClient { Future.failed(pre) }
       withClue(s"${clue} - exitCode = ${pre.exitCode}, stdout = '${pre.stdout}', stderr = '${pre.stderr}': ") {
-        the[ProcessRunningException] thrownBy await(dc.run("image", Seq())) shouldBe pre
+        the[ProcessRunningException] thrownBy await(dc.run("image", Seq.empty)) shouldBe pre
       }
     }
 

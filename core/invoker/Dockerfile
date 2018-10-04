@@ -1,6 +1,11 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more contributor
+# license agreements; and to You under the Apache License, Version 2.0.
+
 FROM scala
 
 ENV DOCKER_VERSION 1.12.0
+
+RUN apk add --update openssl
 
 # Uncomment to fetch latest version of docker instead: RUN wget -qO- https://get.docker.com | sh
 # Install docker client
@@ -11,12 +16,10 @@ rm -f docker-${DOCKER_VERSION}.tgz && \
 chmod +x /usr/bin/docker && \
 chmod +x /usr/bin/docker-runc
 
-COPY build/distributions/invoker.tar ./
-RUN tar xf invoker.tar && \
-rm -f invoker.tar
+ADD build/distributions/invoker.tar ./
 
 COPY init.sh /
 RUN chmod +x init.sh
 
 EXPOSE 8080
-CMD ["init.sh", "0"]
+CMD ["./init.sh", "0"]

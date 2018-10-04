@@ -25,28 +25,23 @@ import scala.collection.parallel.immutable.ParSeq
 import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
-
 import org.junit.runner.RunWith
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.FlatSpec
 import org.scalatest.Matchers
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.junit.JUnitRunner
-
-import common.RunWskAdminCmd
-import common.TestHelpers
-import common.TestUtils
+import common._
 import common.TestUtils._
-import common.WhiskProperties
-import common.rest.WskRest
-import common.WskActorSystem
-import common.WskProps
-import common.WskTestHelpers
+import common.rest.WskRestOperations
+import common.WskAdmin.wskadmin
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 import whisk.http.Messages._
 import whisk.utils.ExecutionContextFactory
 import whisk.utils.retry
+
+import scala.util.{Success, Try}
 
 protected[limits] trait LocalHelper {
   def prefix(msg: String) = msg.substring(0, msg.indexOf('('))
@@ -67,7 +62,7 @@ class ThrottleTests
 
   implicit val testConfig = PatienceConfig(5.minutes)
   implicit val wskprops = WskProps()
-  val wsk = new WskRest
+  val wsk = new WskRestOperations
   val defaultAction = Some(TestUtils.getTestActionFilename("hello.js"))
 
   val throttleWindow = 1.minute
@@ -235,7 +230,7 @@ class ThrottleTests
   it should "throttle 'concurrent' activations of one action" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
     val name = "checkConcurrentActionThrottle"
     assetHelper.withCleaner(wsk.action, name) {
-      val timeoutAction = Some(TestUtils.getTestActionFilename("timeout.js"))
+      val timeoutAction = Some(TestUtils.getTestActionFilename("sleep.js"))
       (action, _) =>
         action.create(name, timeoutAction)
     }
@@ -252,7 +247,10 @@ class ThrottleTests
     // These invokes will stay active long enough that all are issued and load balancer has recognized concurrency.
     val startSlowInvokes = Instant.now
     val slowResults = untilThrottled(slowInvokes) { () =>
-      wsk.action.invoke(name, Map("payload" -> slowInvokeDuration.toMillis.toJson), expectedExitCode = DONTCARE_EXIT)
+      wsk.action.invoke(
+        name,
+        Map("sleepTimeInMs" -> slowInvokeDuration.toMillis.toJson),
+        expectedExitCode = DONTCARE_EXIT)
     }
     val afterSlowInvokes = Instant.now
     val slowIssueDuration = durationBetween(startSlowInvokes, afterSlowInvokes)
@@ -266,7 +264,10 @@ class ThrottleTests
     // These fast invokes will trigger the concurrency-based throttling.
     val startFastInvokes = Instant.now
     val fastResults = untilThrottled(fastInvokes) { () =>
-      wsk.action.invoke(name, Map("payload" -> slowInvokeDuration.toMillis.toJson), expectedExitCode = DONTCARE_EXIT)
+      wsk.action.invoke(
+        name,
+        Map("sleepTimeInMs" -> fastInvokeDuration.toMillis.toJson),
+        expectedExitCode = DONTCARE_EXIT)
     }
     val afterFastInvokes = Instant.now
     val fastIssueDuration = durationBetween(afterFastInvokes, startFastInvokes)
@@ -294,14 +295,30 @@ class NamespaceSpecificThrottleTests
     extends FlatSpec
     with TestHelpers
     with WskTestHelpers
+    with WskActorSystem
     with Matchers
     with BeforeAndAfterAll
     with LocalHelper {
 
-  val wskadmin = new RunWskAdminCmd {}
-  val wsk = new WskRest
-
   val defaultAction = Some(TestUtils.getTestActionFilename("hello.js"))
+
+  val wsk = new WskRestOperations
+
+  def sanitizeNamespaces(namespaces: Seq[String], expectedExitCode: Int = SUCCESS_EXIT): Unit = {
+    val deletions = namespaces.map { ns =>
+      Try {
+        disposeAdditionalTestSubject(ns, expectedExitCode)
+        withClue(s"failed to delete temporary limits for $ns") {
+          wskadmin.cli(Seq("limits", "delete", ns), expectedExitCode)
+        }
+      }
+    }
+    if (expectedExitCode == SUCCESS_EXIT) every(deletions) shouldBe a[Success[_]]
+  }
+
+  sanitizeNamespaces(
+    Seq("zeroSubject", "zeroConcSubject", "oneSubject", "oneSequenceSubject"),
+    expectedExitCode = DONTCARE_EXIT)
 
   // Create a subject with rate limits == 0
   val zeroProps = getAdditionalTestSubject("zeroSubject")
@@ -330,13 +347,7 @@ class NamespaceSpecificThrottleTests
   wskadmin.cli(Seq("limits", "set", oneSequenceProps.namespace, "--invocationsPerMinute", "1", "--firesPerMinute", "1"))
 
   override def afterAll() = {
-    Seq(zeroProps, zeroConcProps, oneProps, oneSequenceProps).foreach { wp =>
-      val ns = wp.namespace
-      disposeAdditionalTestSubject(ns)
-      withClue(s"failed to delete temporary limits for $ns") {
-        wskadmin.cli(Seq("limits", "delete", ns))
-      }
-    }
+    sanitizeNamespaces(Seq(zeroProps, zeroConcProps, oneProps, oneSequenceProps).map(_.namespace))
   }
 
   behavior of "Namespace-specific throttles"

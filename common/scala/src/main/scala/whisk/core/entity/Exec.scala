@@ -27,7 +27,6 @@ import spray.json.DefaultJsonProtocol._
 import whisk.core.entity.Attachments._
 import whisk.core.entity.ExecManifest._
 import whisk.core.entity.size.SizeInt
-import whisk.core.entity.size.SizeOptionString
 import whisk.core.entity.size.SizeString
 
 /**
@@ -115,6 +114,11 @@ sealed abstract class ExecMetaData extends ExecMetaDataBase {
   override def size = 0.B
 }
 
+trait AttachedCode {
+  def inline(bytes: Array[Byte]): Exec
+  def attach(attached: Attached): Exec
+}
+
 protected[core] case class CodeExecAsString(manifest: RuntimeManifest,
                                             override val code: String,
                                             override val entryPoint: Option[String])
@@ -140,25 +144,24 @@ protected[core] case class CodeExecMetaDataAsString(manifest: RuntimeManifest,
 
 protected[core] case class CodeExecAsAttachment(manifest: RuntimeManifest,
                                                 override val code: Attachment[String],
-                                                override val entryPoint: Option[String])
-    extends CodeExec[Attachment[String]] {
+                                                override val entryPoint: Option[String],
+                                                override val binary: Boolean = false)
+    extends CodeExec[Attachment[String]]
+    with AttachedCode {
   override val kind = manifest.kind
   override val image = manifest.image
   override val sentinelledLogs = manifest.sentinelledLogs.getOrElse(true)
   override val deprecated = manifest.deprecated.getOrElse(false)
   override val pull = false
-  override lazy val binary = true
   override def codeAsJson = code.toJson
 
-  def inline(bytes: Array[Byte]): CodeExecAsAttachment = {
+  override def inline(bytes: Array[Byte]): CodeExecAsAttachment = {
     val encoded = new String(bytes, StandardCharsets.UTF_8)
     copy(code = Inline(encoded))
   }
 
-  def attach: CodeExecAsAttachment = {
-    manifest.attached.map { a =>
-      copy(code = Attached(a.attachmentName, a.attachmentType))
-    } getOrElse this
+  override def attach(attached: Attached): CodeExecAsAttachment = {
+    copy(code = attached)
   }
 }
 
@@ -177,17 +180,27 @@ protected[core] case class CodeExecMetaDataAsAttachment(manifest: RuntimeManifes
  * @param code an optional script or zip archive (as base64 encoded) string
  */
 protected[core] case class BlackBoxExec(override val image: ImageName,
-                                        override val code: Option[String],
+                                        override val code: Option[Attachment[String]],
                                         override val entryPoint: Option[String],
-                                        val native: Boolean)
-    extends CodeExec[Option[String]] {
+                                        val native: Boolean,
+                                        override val binary: Boolean)
+    extends CodeExec[Option[Attachment[String]]]
+    with AttachedCode {
   override val kind = Exec.BLACKBOX
   override val deprecated = false
   override def codeAsJson = code.toJson
-  override lazy val binary = code map { Exec.isBinaryCode(_) } getOrElse false
   override val sentinelledLogs = native
   override val pull = !native
   override def size = super.size + image.publicImageName.sizeInBytes
+
+  override def inline(bytes: Array[Byte]): BlackBoxExec = {
+    val encoded = new String(bytes, StandardCharsets.UTF_8)
+    copy(code = Some(Inline(encoded)))
+  }
+
+  override def attach(attached: Attached): BlackBoxExec = {
+    copy(code = Some(attached))
+  }
 }
 
 protected[core] case class BlackBoxExecMetaData(override val image: ImageName,
@@ -212,6 +225,59 @@ protected[core] case class SequenceExecMetaData(components: Vector[FullyQualifie
   override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
 }
 
+protected[core] case class ProjectionExecMetaData(code: String) extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.PROJECTION
+  override val deprecated = false  
+  //override def size = action.size
+  override def size = code.sizeInBytes
+}
+
+protected[core] case class ProjectionExec (code: String) extends Exec {
+  override val kind = Exec.PROJECTION
+  override val deprecated = false
+  //override def size = action.size
+  override def size = code.sizeInBytes
+}
+
+protected[core] case class ProgramExecMetaData (components: Vector[FullyQualifiedEntityName]) extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.PROGRAM
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
+protected[core] case class ProgramExec(components: Vector[FullyQualifiedEntityName]) extends Exec {
+  override val kind = Exec.PROGRAM
+  override val deprecated = false
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
+protected[core] case class AppExecMetaData() extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.APP
+  override val deprecated = false
+  override def size = 0.B
+}
+
+protected[core] case class AppExec () extends Exec {
+  override val kind = Exec.APP
+  override val deprecated = false
+  override def size = 0.B
+}
+
+
+protected[core] case class ForkExecMetaData(components: Vector[FullyQualifiedEntityName]) extends ExecMetaDataBase {
+  override val kind = ExecMetaDataBase.FORK
+  override val deprecated = false  
+  //override def size = action.size
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
+protected[core] case class ForkExec (components: Vector[FullyQualifiedEntityName]) extends Exec {
+  override val kind = Exec.FORK
+  override val deprecated = false
+  //override def size = action.size
+  override def size = components.map(_.size).reduceOption(_ + _).getOrElse(0.B)
+}
+
 protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol {
 
   val sizeLimit = 48 MB
@@ -221,7 +287,11 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
   // - Black Box because it is a type marker
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
-
+  protected[core] val PROJECTION = "projection"
+  protected[core] val PROGRAM = "program"
+  protected[core] val FORK = "fork"
+  protected[core] val APP = "app"
+  
   private def execManifests = ExecManifest.runtimesManifest
 
   override protected[core] implicit lazy val serdes = new RootJsonFormat[Exec] {
@@ -242,14 +312,29 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
 
       case s @ SequenceExec(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
-
+      
+      case s @ ProgramExec(comp) => {
+        System.out.println (s"ProgramExec components $comp")
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      }
+      
+      case p @ ProjectionExec(code) =>
+        JsObject("kind" -> JsString(p.kind), "code" -> JsString(code))
+        //"action" -> action.qualifiedNameWithLeadingSlash.toJson, 
+      
+      case f @ ForkExec(comp) => 
+        JsObject("kind" -> JsString(f.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+                 
+      case a @ AppExec() =>
+        JsObject("kind" -> JsString(a.kind))
+        
       case b: BlackBoxExec =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
-        val code = b.code.filter(_.trim.nonEmpty).map("code" -> JsString(_))
+        val code = b.code.map("code" -> attFmt[String].write(_))
         val main = b.entryPoint.map("main" -> JsString(_))
         JsObject(base ++ code ++ main)
-      case _ => JsObject()
+      case _ => JsObject.empty
     }
 
     override def read(v: JsValue) = {
@@ -277,7 +362,35 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
             case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
           }
           SequenceExec(comp)
-
+        
+        case Exec.PROGRAM =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ProgramExec(comp)
+          
+        case Exec.PROJECTION =>
+          //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
+          val schemaCode : String = obj.fields.get("code") match {
+            case Some(JsString(t)) => t
+            case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
+            case None => "."
+          }
+          ProjectionExec(schemaCode)
+        
+        case Exec.FORK =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ForkExec (comp)
+        
+        case Exec.APP =>
+          AppExec()
+          
         case Exec.BLACKBOX =>
           val image: ImageName = obj.fields.get("image") match {
             case Some(JsString(i)) => ImageName.fromString(i).get // throws deserialization exception on failure
@@ -285,15 +398,13 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
               throw new DeserializationException(
                 s"'image' must be a string defined in 'exec' for '${Exec.BLACKBOX}' actions")
           }
-          val code: Option[String] = obj.fields.get("code") match {
-            case Some(JsString(i)) => if (i.trim.nonEmpty) Some(i) else None
-            case Some(_) =>
-              throw new DeserializationException(
-                s"if defined, 'code' must a string defined in 'exec' for '${Exec.BLACKBOX}' actions")
-            case None => None
+          val (codeOpt: Option[Attachment[String]], binary) = obj.fields.get("code") match {
+            case None                                => (None, false)
+            case Some(JsString(i)) if i.trim.isEmpty => (None, false)
+            case Some(code)                          => (Some(attFmt[String].read(code)), isBinary(code, obj))
           }
           val native = execManifests.skipDockerPull(image)
-          BlackBoxExec(image, code, optMainField, native)
+          BlackBoxExec(image, codeOpt, optMainField, native, binary)
 
         case _ =>
           // map "default" virtual runtime versions to the currently blessed actual runtime version
@@ -303,22 +414,20 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
           }
 
           manifest.attached
-            .map { a =>
-              val jar: Attachment[String] = {
-                // java actions once stored the attachment in "jar" instead of "code"
-                obj.fields.get("code").orElse(obj.fields.get("jar"))
-              } map {
-                attFmt[String].read(_)
-              } getOrElse {
+            .map { _ =>
+              // java actions once stored the attachment in "jar" instead of "code"
+              val code = obj.fields.get("code").orElse(obj.fields.get("jar")).getOrElse {
                 throw new DeserializationException(
-                  s"'code' must be a valid base64 string in 'exec' for '$kind' actions")
+                  s"'code' must be a string or attachment object defined in 'exec' for '$kind' actions")
               }
+
               val main = optMainField.orElse {
                 if (manifest.requireMain.exists(identity)) {
                   throw new DeserializationException(s"'main' must be a string defined in 'exec' for '$kind' actions")
                 } else None
               }
-              CodeExecAsAttachment(manifest, jar, main)
+
+              CodeExecAsAttachment(manifest, attFmt[String].read(code), main, isBinary(code, obj))
             }
             .getOrElse {
               val code: String = obj.fields.get("code") match {
@@ -340,6 +449,13 @@ protected[core] object Exec extends ArgNormalizer[Exec] with DefaultJsonProtocol
       (t.length > 0) && (t.length % 4 == 0) && isBase64Pattern.matcher(t).matches()
     } else false
   }
+
+  private def isBinary(code: JsValue, obj: JsObject): Boolean = {
+    code match {
+      case JsString(c) => isBinaryCode(c)
+      case _           => obj.fields.get("binary").map(_.convertTo[Boolean]).getOrElse(false)
+    }
+  }
 }
 
 protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] with DefaultJsonProtocol {
@@ -351,7 +467,11 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
   // - Black Box because it is a type marker
   protected[core] val SEQUENCE = "sequence"
   protected[core] val BLACKBOX = "blackbox"
-
+  protected[core] val PROJECTION = "projection"
+  protected[core] val PROGRAM = "program"
+  protected[core] val FORK = "fork"
+  protected[core] val APP = "app"
+  
   private def execManifests = ExecManifest.runtimesManifest
 
   override protected[core] implicit lazy val serdes = new RootJsonFormat[ExecMetaDataBase] {
@@ -372,7 +492,18 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
 
       case s @ SequenceExecMetaData(comp) =>
         JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
-
+      
+      case s @ ProgramExecMetaData(comp) =>
+        JsObject("kind" -> JsString(s.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      
+      case p @ ProjectionExecMetaData(code) =>
+        JsObject("kind" -> JsString(p.kind), //"action" -> action.qualifiedNameWithLeadingSlash.toJson, 
+                 "code" -> JsString(code))
+      case f @ ForkExecMetaData (comp) => 
+        JsObject("kind" -> JsString(f.kind), "components" -> comp.map(_.qualifiedNameWithLeadingSlash).toJson)
+      case a @ AppExecMetaData () =>
+        JsObject("kind" -> JsString(a.kind))
+        
       case b: BlackBoxExecMetaData =>
         val base =
           Map("kind" -> JsString(b.kind), "image" -> JsString(b.image.publicImageName), "binary" -> JsBoolean(b.binary))
@@ -410,7 +541,41 @@ protected[core] object ExecMetaDataBase extends ArgNormalizer[ExecMetaDataBase] 
             case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
           }
           SequenceExecMetaData(comp)
-
+        
+        case ExecMetaDataBase.PROGRAM =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          ProgramExecMetaData(comp)
+          
+        case ExecMetaDataBase.PROJECTION =>
+          //val action: FullyQualifiedEntityName = FullyQualifiedEntityName.serdes.read (obj.fields.get("action").getOrElse (JsObject.empty))
+          //val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+          //  case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+          //  case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+          //  case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          //}
+          val schemaCode : String = obj.fields.get("code") match {
+            case Some(JsString(i)) => i
+            case Some(m) => throw new DeserializationException(s"'schema code must be string found $m")
+            case None => "."
+          }
+        
+          ProjectionExecMetaData(schemaCode)
+        
+        case ExecMetaDataBase.FORK =>
+          val comp: Vector[FullyQualifiedEntityName] = obj.fields.get("components") match {
+            case Some(JsArray(components)) => components map (FullyQualifiedEntityName.serdes.read(_))
+            case Some(_)                   => throw new DeserializationException(s"'components' must be an array")
+            case None                      => throw new DeserializationException(s"'components' must be defined for sequence kind")
+          }
+          
+          ForkExecMetaData (comp)
+        case ExecMetaDataBase.APP =>
+          AppExecMetaData ()
+          
         case ExecMetaDataBase.BLACKBOX =>
           val image: ImageName = obj.fields.get("image") match {
             case Some(JsString(i)) => ImageName.fromString(i).get // throws deserialization exception on failure
