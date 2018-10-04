@@ -296,7 +296,7 @@ protected[actions] trait PrimitiveActions {
   
       // create the whisk activation
       val activation = WhiskActivation(
-        namespace = user.namespace.toPath,
+        namespace = user.namespace.name.toPath,
         name = action.name,
         user.subject,
         activationId = activationIdFactory.make(),
@@ -313,9 +313,11 @@ protected[actions] trait PrimitiveActions {
           //~ causedBy ++
           //~ sequenceLimits,
         duration = Some(end.getEpochSecond() - start.getEpochSecond()))
-  
+
+      val context = UserContext(user)
+
       logging.debug(this, s"recording activation '${activation.activationId}'")
-      WhiskActivation.put(activationStore, activation)(transid, notifier = None) onComplete {
+      activationStore.store(activation, context)(transid, notifier = None) onComplete {
         case Success(id) => logging.debug(this, s"recorded activation")
         case Failure(t) =>
           logging.error(
