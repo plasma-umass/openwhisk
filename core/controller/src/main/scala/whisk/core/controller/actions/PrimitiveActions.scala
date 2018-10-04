@@ -210,13 +210,26 @@ protected[actions] trait PrimitiveActions {
                     val WhiskActivation (_ns, _name, _subject, _id, _start, _end, _cause, 
                                          _response, _logs, _version, _publish, _ann, _duration) = activation
                     
-                    val ActivationResponse (code, responseJsObject) = _response
-                    System.out.println(s"invokeFork: responseJsObject = $responseJsObject")
-                    var newResponseMap  = Map[String, JsValue] ()
-                    newResponseMap += ("output" -> responseJsObject.getOrElse(JsObject.empty))
-                    newResponseMap += ("saved" -> payloadMap.getOrElse ("saved", JsObject.empty))
-                    val newResponse = JsObject(newResponseMap)
-                    System.out.println(s"invokeFork: newResponse $newResponse")
+                    var newResponseJSON = JsObject.empty
+                    var result = _response
+
+                    val outputPayload = _response.result.map(_.asJsObject)
+                    val payloadContent = outputPayload getOrElse JsObject.empty
+                    val errorField = payloadContent.fields.get(ActivationResponse.ERROR_FIELD)
+
+                    if (errorField.isEmpty) {
+                      val ActivationResponse (code, responseJsObject) = _response
+                      System.out.println(s"invokeFork: responseJsObject = $responseJsObject")
+                      var newResponseMap  = Map[String, JsValue] ()
+                      newResponseMap += ("output" -> responseJsObject.getOrElse(JsObject.empty))
+                      newResponseMap += ("saved" -> payloadMap.getOrElse ("saved", JsObject.empty))
+                      newResponseJSON = JsObject(newResponseMap)
+                      result = ActivationResponse.success (Option(newResponseJSON))
+                    } else {
+                      assert(errorField.isDefined)
+                    }
+
+                    System.out.println(s"invokeFork: result $result")
                     val newActivation = WhiskActivation(namespace = _ns,
                            name = _name,
                            subject = _subject,
@@ -224,7 +237,7 @@ protected[actions] trait PrimitiveActions {
                            start = _start,
                            end = _end,
                            cause = _cause,
-                           response = ActivationResponse.success (Option(newResponse)),
+                           response = result,
                            logs = _logs,
                            version = _version,
                            publish = _publish,
