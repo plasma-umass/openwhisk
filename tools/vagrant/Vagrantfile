@@ -9,15 +9,15 @@
 # Use vagrant suspend and vagrant up (using up it skips provisioning)
 
 BOX = "ubuntu/trusty64"
-BOX_MEMORY = ENV['BOX_MEMORY'] || '4096'
-BOX_CPUS = ENV['BOX_CPUS'] || '4'
+BOX_MEMORY = ENV['BOX_MEMORY'] || '1800'
+BOX_CPUS = ENV['BOX_CPUS'] || '8'
 MACHINE_IP = ENV['MACHINE_IP'] || '192.168.33.13'
 OW_DB = if ENV['OW_DB'] =~ (/^(cloudant|couchdb)$/i) then true else false end
 
 Vagrant.configure('2') do |config|
   config.vm.box = BOX
   config.vm.network :private_network, ip: MACHINE_IP
-
+  Vagrant::DEFAULT_SERVER_URL.replace('https://vagrantcloud.com')
   # If true, then any SSH connections made will enable agent forwarding.
   # Default value: false
   config.ssh.forward_agent = true
@@ -54,7 +54,7 @@ $script_common = <<SCRIPT
 
   # Configure swapfile
   echo 'swapfile not found. Adding swapfile.'
-  fallocate -l 8000M /swapfile
+  fallocate -l 1024M /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
   swapon /swapfile
