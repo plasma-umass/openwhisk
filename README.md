@@ -34,8 +34,9 @@ docker ps
 #Go to directory where CLI Binaries are
 cd <openwhisk_home>/bin
 #Set 172.17.0.1 as api host address and auth key
-./wsk property set --apihost 172.17.0.1 --auth `./wsk property get --auth`
+./wsk property set --apihost 172.17.0.1
 #Auth key can be manually setup to 23bc46b1-71f6-4ed5-8c54-816aa4f8c502:123zO3xZCLrMN6v2BKK1dXYFpXlPkccOFqm12CdAsMgRU4VrNZ9lyGVCGuMDGIwP
+./wsk property set --auth 23bc46b1-71f6-4ed5-8c54-816aa4f8c502:123zO3xZCLrMN6v2BKK1dXYFpXlPkccOFqm12CdAsMgRU4VrNZ9lyGVCGuMDGIwP
 #Check if list namespaces contains a guest namespace, otherwise there is something wrong.
 ./wsk -i namespace list
 ```
