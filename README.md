@@ -1,4 +1,4 @@
-OpenWhisk SPL implementation for the paper *Formal Foundations of Serverless Computing*.
+OpenWhisk SPL implementation for the paper [*Formal Foundations of Serverless Computing*](https://arxiv.org/abs/1902.05870).
 
 ### Deploying OpenWhisk using Docker container on Ubuntu 14.04
 Deployment has been tested on Ubuntu 14.04
